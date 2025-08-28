@@ -1,0 +1,11 @@
+torch>=2.3
+pytorch-lightning>=2.2
+transformers>=4.42
+datasets>=2.19
+tokenizers>=0.15
+sentencepiece>=0.1.99
+pyyaml>=6.0
+accelerate>=0.33
+
+# Optional speedups on CUDA machines (ignored on MPS):
+# flash-attn>=2.5.8

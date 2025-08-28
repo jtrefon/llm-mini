@@ -1,0 +1,41 @@
+model:
+  n_layers: 16
+  d_model: 768
+  n_heads: 12
+  n_kv_heads: 2           # GQA: KV heads < Q heads
+  d_ff: 3072              # ~4x d_model, SwiGLU inside will split
+  dropout: 0.0
+  vocab_size: null        # filled from tokenizer
+  rope_theta: 1000000     # RoPE base; larger supports longer context
+  tie_embeddings: true
+  swa_window: 0           # set >0 to enable Sliding-Window Attention (tokens can attend last W)
+
+training:
+  seq_len: 1024
+  micro_batch_size: 1
+  grad_accum_steps: 32    # effective batch = micro_batch * accum * devices
+  max_steps: 2000
+  eval_every: 200
+  save_every: 500
+  lr: 3.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  warmup_ratio: 0.01
+  precision: "16-mixed"
+  seed: 42
+
+hardware:
+  accelerator: "mps"      # "mps" on Apple Silicon; use "gpu" on 4090; "auto" also works
+  devices: 1
+  num_workers: 2
+
+# Dataset options. Start with a preprocessed, manageable corpus.
+data:
+  dataset: "shahrukhx01/wikipedia-bookscorpus-en-preprocessed"
+  split: "train"
+  text_field: "text"
+  streaming: false        # memory-mapped Arrow; set true for huge corpora
+  tokenizer_name: "gpt2"  # change to a Llama tokenizer later if you have access
+  max_shards: null        # optional: limit shards/rows for quick smoke tests
+  pack_sequences: true    # concatenate tokens and pack into fixed-length blocks

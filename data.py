@@ -1,0 +1,101 @@
+from typing import Iterator, List, Dict
+import random
+import itertools
+import torch
+from torch.utils.data import Dataset, DataLoader
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+
+class PackedLMDataset(Dataset):
+    """
+    Concatenate tokenized text and pack into fixed-length sequences for causal LM.
+    Produces items with fields: input_ids, labels (next token prediction).
+    """
+    def __init__(self, token_sequences: List[List[int]], seq_len: int):
+        super().__init__()
+        # Flatten all token lists with EOS between docs for safety
+        eos = None
+        flat: List[int] = []
+        for toks in token_sequences:
+            flat.extend(toks)
+        total = len(flat)
+        # Create chunks of length seq_len+1 (so labels are shifted)
+        self.seq_len = seq_len
+        self.inputs: List[torch.Tensor] = []
+        self.labels: List[torch.Tensor] = []
+        n_chunks = total // (seq_len + 1)
+        for i in range(n_chunks):
+            start = i * (seq_len + 1)
+            end = start + (seq_len + 1)
+            chunk = flat[start:end]
+            x = torch.tensor(chunk[:-1], dtype=torch.long)
+            y = torch.tensor(chunk[1:], dtype=torch.long)
+            self.inputs.append(x)
+            self.labels.append(y)
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        return {
+            'input_ids': self.inputs[idx],
+            'labels': self.labels[idx]
+        }
+
+
+def load_text_dataset(name: str, split: str, text_field: str, streaming: bool=False, max_shards=None):
+    """Load a HF dataset and yield raw text strings."""
+    ds = load_dataset(name, split=split, streaming=streaming)
+    if max_shards and hasattr(ds, 'shard') and not streaming:
+        ds = ds.shuffle(seed=1234).shard(num_shards=max_shards, index=0)
+    for ex in ds:
+        text = ex[text_field]
+        if isinstance(text, str) and len(text) > 0:
+            yield text
+
+
+def build_token_sequences(tokenizer, texts: Iterator[str], max_docs: int = 20000):
+    """Tokenize an iterator of texts into lists of token ids, capping doc count for laptop sanity."""
+    tokens: List[List[int]] = []
+    for i, t in enumerate(texts):
+        enc = tokenizer(t, add_special_tokens=True, truncation=False)
+        tokens.append(enc['input_ids'])
+        if (i + 1) >= max_docs:
+            break
+    return tokens
+
+def collate(batch: List[Dict[str, torch.Tensor]]):
+    x = torch.stack([b['input_ids'] for b in batch], dim=0)
+    y = torch.stack([b['labels'] for b in batch], dim=0)
+    return {'input_ids': x, 'labels': y}
+
+def make_dataloaders(cfg, tokenizer):
+    # Load text and tokenize a capped number of docs (edit max_docs for more)
+    texts = load_text_dataset(
+        name=cfg['data']['dataset'],
+        split=cfg['data']['split'],
+        text_field=cfg['data']['text_field'],
+        streaming=cfg['data']['streaming'],
+        max_shards=cfg['data']['max_shards']
+    )
+    token_seqs = build_token_sequences(tokenizer, texts, max_docs=20000)  # ~quick start
+    train_ds = PackedLMDataset(token_seqs, seq_len=cfg['training']['seq_len'])
+
+    loader = DataLoader(
+        train_ds,
+        batch_size=cfg['training']['micro_batch_size'],
+        shuffle=True,
+        num_workers=cfg['hardware']['num_workers'],
+        pin_memory=False,
+        collate_fn=collate
+    )
+    return loader
+
+
+def get_tokenizer(cfg):
+    tok_name = cfg['data']['tokenizer_name']
+    tok = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token if tok.eos_token is not None else tok.unk_token
+    return tok
