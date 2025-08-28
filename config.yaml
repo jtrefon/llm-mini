@@ -39,3 +39,7 @@ data:
   tokenizer_name: "gpt2"  # change to a Llama tokenizer later if you have access
   max_shards: null        # optional: limit shards/rows for quick smoke tests
   pack_sequences: true    # concatenate tokens and pack into fixed-length blocks
+
+  # Dataset size configuration
+  train_docs: 20000       # Number of training documents
+  val_docs: 2000          # Number of validation documents (separate batch)

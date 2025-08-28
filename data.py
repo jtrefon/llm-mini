@@ -71,18 +71,18 @@ def collate(batch: List[Dict[str, torch.Tensor]]):
     return {'input_ids': x, 'labels': y}
 
 def make_dataloaders(cfg, tokenizer):
-    # Load text and tokenize a capped number of docs (edit max_docs for more)
-    texts = load_text_dataset(
+    # Load training data
+    train_texts = load_text_dataset(
         name=cfg['data']['dataset'],
         split=cfg['data']['split'],
         text_field=cfg['data']['text_field'],
         streaming=cfg['data']['streaming'],
         max_shards=cfg['data']['max_shards']
     )
-    token_seqs = build_token_sequences(tokenizer, texts, max_docs=20000)  # ~quick start
-    train_ds = PackedLMDataset(token_seqs, seq_len=cfg['training']['seq_len'])
+    train_token_seqs = build_token_sequences(tokenizer, train_texts, max_docs=cfg['data']['train_docs'])
+    train_ds = PackedLMDataset(train_token_seqs, seq_len=cfg['training']['seq_len'])
 
-    loader = DataLoader(
+    train_loader = DataLoader(
         train_ds,
         batch_size=cfg['training']['micro_batch_size'],
         shuffle=True,
@@ -90,7 +90,30 @@ def make_dataloaders(cfg, tokenizer):
         pin_memory=False,
         collate_fn=collate
     )
-    return loader
+
+    # Load validation data (separate batch from same dataset)
+    val_texts = load_text_dataset(
+        name=cfg['data']['dataset'],
+        split=cfg['data']['split'],
+        text_field=cfg['data']['text_field'],
+        streaming=cfg['data']['streaming'],
+        max_shards=cfg['data']['max_shards']
+    )
+    # Skip first train_docs documents, take next val_docs for validation
+    val_texts_sliced = itertools.islice(val_texts, cfg['data']['train_docs'], cfg['data']['train_docs'] + cfg['data']['val_docs'])
+    val_token_seqs = build_token_sequences(tokenizer, val_texts_sliced, max_docs=cfg['data']['val_docs'])
+    val_ds = PackedLMDataset(val_token_seqs, seq_len=cfg['training']['seq_len'])
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg['training']['micro_batch_size'],
+        shuffle=False,
+        num_workers=cfg['hardware']['num_workers'],
+        pin_memory=False,
+        collate_fn=collate
+    )
+
+    return train_loader, val_loader
 
 
 def get_tokenizer(cfg):
