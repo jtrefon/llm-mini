@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional
 import torch
@@ -41,16 +42,20 @@ def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.T
     sin, cos: [T, D/2]
     """
     B, T, H, D = x.shape
+    # Compute RoPE in float32 for numerical stability, then cast back
+    orig_dtype = x.dtype
+    x = x.to(torch.float32)
     x = x.view(B, T, H, D // 2, 2)
     x1 = x[..., 0]
     x2 = x[..., 1]
     # Broadcast sin/cos: [T, D/2] -> [1, T, 1, D/2]
-    sin_ = sin.view(1, T, 1, -1)
-    cos_ = cos.view(1, T, 1, -1)
+    sin_ = sin.to(torch.float32).view(1, T, 1, -1)
+    cos_ = cos.to(torch.float32).view(1, T, 1, -1)
     # (x1, x2) rotated
     out1 = x1 * cos_ - x2 * sin_
     out2 = x1 * sin_ + x2 * cos_
-    return torch.stack((out1, out2), dim=-1).view(B, T, H, D)
+    out = torch.stack((out1, out2), dim=-1).view(B, T, H, D)
+    return out.to(orig_dtype)
 
 
 # ---- SwiGLU MLP (PaLM-style)
@@ -105,6 +110,7 @@ class GQAMultiheadAttention(nn.Module):
         k = k.permute(0, 2, 1, 3).reshape(B * self.n_heads, T, self.head_dim)
         v = v.permute(0, 2, 1, 3).reshape(B * self.n_heads, T, self.head_dim)
 
+
         # Build causal/sliding window mask if needed. PyTorch SDPA can use attn_mask of shape [T, T] or [B*H, T, T]
         attn_mask_t = None
         if causal or swa_window > 0:
@@ -122,17 +128,29 @@ class GQAMultiheadAttention(nn.Module):
             else:
                 attn_mask_t = causal_mask
 
-        try:
-            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask_t, dropout_p=self.dropout.p if self.training else 0.0, is_causal=False)
-        except Exception:
-            # Fallback manual attention (should rarely trigger)
-            d = q.size(-1)
-            scores = q @ k.transpose(-2, -1) / math.sqrt(d)
+        # Attention: prefer manual math on MPS for stability; use SDPA elsewhere
+        if x.device.type == 'mps':
+            # Compute in float32 to avoid NaNs
+            qf = q.to(torch.float32)
+            kf = k.to(torch.float32)
+            vf = v.to(torch.float32)
+            scores = torch.bmm(qf, kf.transpose(1, 2)) * (1.0 / math.sqrt(self.head_dim))  # [B*H, T, T]
             if attn_mask_t is not None:
-                scores = scores.masked_fill(attn_mask_t, float('-inf'))
-            attn = torch.softmax(scores, dim=-1)
-            attn = self.dropout(attn)
-            attn = attn @ v
+                mask = attn_mask_t
+                if mask.dim() == 2:
+                    mask = mask.unsqueeze(0).expand(scores.size(0), -1, -1)
+                scores = scores.masked_fill(mask, float('-inf'))
+            weights = torch.softmax(scores, dim=-1)
+            if self.training and self.dropout.p > 0:
+                weights = self.dropout(weights)
+            attn = torch.bmm(weights, vf).to(q.dtype)
+        else:
+            attn = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask_t,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False,
+            )
 
         attn = attn.reshape(B, self.n_heads, T, self.head_dim).permute(0, 2, 1, 3).contiguous().view(B, T, C)
         return self.out(attn)
@@ -188,15 +206,17 @@ class GPTMini(nn.Module):
         self._rope_cache_params = (0, 0, 0.0)  # (seq_len, head_dim, theta)
 
     def _maybe_build_rope(self, seq_len: int, head_dim: int, theta: float, device, dtype):
+        # Build RoPE cache in float32 to avoid numerical issues when model tensors are float16
+        rope_dtype = torch.float32
         if self._rope_sin is None:
-            sin, cos = build_rope_cache(seq_len, head_dim, theta, device, dtype)
+            sin, cos = build_rope_cache(seq_len, head_dim, theta, device, rope_dtype)
             self._rope_sin = sin
             self._rope_cos = cos
             self._rope_cache_params = (seq_len, head_dim, theta)
         else:
             cached = self._rope_cache_params
             if cached != (seq_len, head_dim, theta):
-                sin, cos = build_rope_cache(seq_len, head_dim, theta, device, dtype)
+                sin, cos = build_rope_cache(seq_len, head_dim, theta, device, rope_dtype)
                 self._rope_sin = sin
                 self._rope_cos = cos
                 self._rope_cache_params = (seq_len, head_dim, theta)
@@ -207,7 +227,7 @@ class GPTMini(nn.Module):
         h = self.tok_emb(input_ids)  # [B,T,C]
         head_dim = self.config.d_model // self.config.n_heads
         self._maybe_build_rope(T, head_dim, self.config.rope_theta, h.device, h.dtype)
-        for blk in self.blocks:
+        for i, blk in enumerate(self.blocks):
             h = blk(h, self._rope_sin, self._rope_cos, swa_window=self.config.swa_window)
         h = self.norm_f(h)
         logits = self.lm_head(h)

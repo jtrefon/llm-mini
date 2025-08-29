@@ -34,6 +34,9 @@ class PackedLMDataset(Dataset):
             self.inputs.append(x)
             self.labels.append(y)
 
+        # For resumable dataloader support
+        self._current_epoch = 0
+
     def __len__(self):
         return len(self.inputs)
 
@@ -42,6 +45,14 @@ class PackedLMDataset(Dataset):
             'input_ids': self.inputs[idx],
             'labels': self.labels[idx]
         }
+
+    def state_dict(self):
+        """Support for resumable dataloader."""
+        return {'current_epoch': self._current_epoch}
+
+    def load_state_dict(self, state_dict):
+        """Support for resumable dataloader."""
+        self._current_epoch = state_dict.get('current_epoch', 0)
 
 
 def load_text_dataset(name: str, split: str, text_field: str, streaming: bool=False, max_shards=None):
@@ -88,6 +99,7 @@ def make_dataloaders(cfg, tokenizer):
         shuffle=True,
         num_workers=cfg['hardware']['num_workers'],
         pin_memory=False,
+        persistent_workers=False,
         collate_fn=collate
     )
 
@@ -110,6 +122,7 @@ def make_dataloaders(cfg, tokenizer):
         shuffle=False,
         num_workers=cfg['hardware']['num_workers'],
         pin_memory=False,
+        persistent_workers=False,
         collate_fn=collate
     )
 

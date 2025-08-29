@@ -1,0 +1,4 @@
+timestamp | epoch | train_loss | val_loss | lr
+2025-08-29 11:10:27 | epoch=105 | train_loss=- | val_loss=7.0010 | lr=0.000212
+2025-08-29 11:15:28 | epoch=106 | train_loss=6.5707 | val_loss=7.0309 | lr=0.000210
+2025-08-29 11:19:43 | epoch=107 | train_loss=6.5962 | val_loss=7.0667 | lr=0.000209
