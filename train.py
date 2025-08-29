@@ -34,6 +34,33 @@ class WarmupCosine:
         return 0.5 * (1 + math.cos(math.pi * progress))
 
 
+class EarlyStoppingRespectConfig(EarlyStopping):
+    """EarlyStopping that preserves patience from config on resume.
+
+    PyTorch Lightning restores callback state from checkpoints, including the
+    "patience" and current "wait_count". If the checkpoint was created with a
+    different patience (e.g., 3) and you later increase it in config (e.g., 5),
+    the restored state would override your new value and stop too early.
+
+    This subclass keeps the configured patience across resume, and optionally
+    resets the wait counter so you don't immediately stop after resuming.
+    """
+
+    def __init__(self, *args, configured_patience: int | None = None, reset_wait_on_resume: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Keep the configured patience regardless of what the checkpoint contains
+        self._configured_patience = configured_patience if configured_patience is not None else self.patience
+        self._reset_wait_on_resume = reset_wait_on_resume
+        self.patience = self._configured_patience
+
+    def load_state_dict(self, state_dict):
+        # Restore best_score and counters, then enforce new patience
+        super().load_state_dict(state_dict)
+        self.patience = self._configured_patience
+        if self._reset_wait_on_resume:
+            self.wait_count = 0
+
+
 class LitCausalLM(pl.LightningModule):
     def __init__(self, cfg, tokenizer):
         super().__init__()
@@ -459,12 +486,15 @@ def main(config_path='config.yaml'):
 
     # Early stopping on validation loss, evaluated after validation not train epoch end
     es_cfg = cfg['training'].get('early_stopping', {})
-    early_stop_cb = EarlyStopping(
+    early_stop_cb = EarlyStoppingRespectConfig(
         monitor='val_loss',
         mode='min',
         patience=es_cfg.get('patience', cfg['training']['early_stopping']['patience']),
         min_delta=es_cfg.get('min_delta', cfg['training']['early_stopping']['min_delta']),
         check_on_train_epoch_end=False,
+        configured_patience=es_cfg.get('patience', cfg['training']['early_stopping']['patience']),
+        reset_wait_on_resume=True,
+        verbose=True,
     )
 
     # Optionally cap steps per epoch to sync with validation cadence
