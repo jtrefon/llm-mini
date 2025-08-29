@@ -1,0 +1,17 @@
+README.md
+setup.py
+src/domain/__init__.py
+src/domain/entities/__init__.py
+src/domain/entities/model_config.py
+src/domain/entities/training_config.py
+src/domain/models/__init__.py
+src/domain/models/gpt_mini.py
+src/domain/repositories/__init__.py
+src/domain/repositories/checkpoint_repository.py
+src/domain/services/__init__.py
+src/domain/services/training_service.py
+src/transformers_clean_arch.egg-info/PKG-INFO
+src/transformers_clean_arch.egg-info/SOURCES.txt
+src/transformers_clean_arch.egg-info/dependency_links.txt
+src/transformers_clean_arch.egg-info/requires.txt
+src/transformers_clean_arch.egg-info/top_level.txt
