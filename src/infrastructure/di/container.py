@@ -35,6 +35,16 @@ class Container:
             hardware_config: Hardware settings
             data_config: Dataset configuration
         """
+        # Populate vocab_size from tokenizer if not provided
+        if model_config.vocab_size is None and data_config and getattr(data_config, 'tokenizer_name', None):
+            try:
+                from transformers import AutoTokenizer  # import locally to avoid hard dep at import time
+                tok = AutoTokenizer.from_pretrained(data_config.tokenizer_name, use_fast=True)
+                model_config.vocab_size = int(tok.vocab_size)
+            except Exception:
+                # Leave as None; model factory may handle or will raise a clearer error later
+                pass
+
         self._configs.update({
             'model': model_config,
             'training': training_config,
@@ -68,8 +78,10 @@ class Container:
             # Import here to avoid circular dependencies
             from src.infrastructure.data.pytorch_data_loader_factory import PyTorchDataLoaderFactory
             data_config = self._configs.get('data')
+            hardware_config = self._configs.get('hardware')
             if data_config:
-                self._services['data_loader_factory'] = PyTorchDataLoaderFactory(data_config)
+                num_workers = getattr(hardware_config, 'num_workers', 0) if hardware_config else 0
+                self._services['data_loader_factory'] = PyTorchDataLoaderFactory(data_config, num_workers=num_workers)
             else:
                 raise ValueError("Data configuration not registered")
         return self._services['data_loader_factory']
@@ -84,7 +96,8 @@ class Container:
             self._services['training_service'] = PyTorchLightningTrainingService(
                 checkpoint_repo=checkpoint_repo,
                 model_factory=model_factory,
-                data_loader_factory=data_loader_factory
+                data_loader_factory=data_loader_factory,
+                hardware_config=self._configs.get('hardware')
             )
         return self._services['training_service']
 

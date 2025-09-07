@@ -1,5 +1,5 @@
 # finetune.py
-import os, glob, math, yaml
+import os, glob, math, yaml, shutil
 from typing import Dict, List, Optional
 
 import torch
@@ -10,7 +10,14 @@ from datasets import load_dataset, Dataset as HFDataset
 from transformers import AutoTokenizer
 
 from model import GPTMini, GPTConfig
-from train import LitCausalLM, WarmupCosine  # reuse your existing LightningModule & scheduler
+from train import (
+    LitCausalLM,
+    WarmupCosine,
+    WarmupLRCallback,
+    select_checkpoint_interactively,
+    discover_checkpoints,
+    find_latest_checkpoint,
+)  # reuse your existing LightningModule & checkpoint utilities
 
 # ---- Nice-to-haves for CUDA/MPS
 try:
@@ -26,7 +33,8 @@ except Exception:
 class InstructPairDataset(Dataset):
     """
     Supervised fine-tuning dataset for instruction following.
-    Labels are -100 for prompt tokens (ignored by CE), real ids for response tokens.
+    Labels are next-token targets with prompt tokens masked (-100). The last prompt
+    token predicts the first response token; loss is only applied where labels >= 0.
     """
     def __init__(self, hf_ds: HFDataset, tokenizer: AutoTokenizer, seq_len: int):
         self.ds = hf_ds
@@ -57,18 +65,32 @@ class InstructPairDataset(Dataset):
             resp_text += self.tok.eos_token
         resp_ids = self.tok(resp_text, add_special_tokens=False, truncation=False)["input_ids"]
 
+        # Build input sequence and next-token labels (shifted) while masking prompt
         input_ids = prompt_ids + resp_ids
-        labels = [-100] * len(prompt_ids) + resp_ids  # mask prompt
+        labels = [-100] * len(input_ids)
+        prompt_len = len(prompt_ids)
+        # Start from prompt_len-1 so the last prompt token predicts first response token
+        start_t = max(0, prompt_len - 1)
+        for t in range(start_t, len(input_ids) - 1):
+            labels[t] = input_ids[t + 1]
 
-        # hard truncate from the left if too long (keep the tail where the response lives)
+        # Hard truncate from the left if too long (prefer tail where response lives)
         if len(input_ids) > self.seq_len:
             cut = len(input_ids) - self.seq_len
             input_ids = input_ids[cut:]
             labels    = labels[cut:]
-            # ensure at least some supervised tokens remain
+            # ensure at least some supervised tokens remain; if not, rebuild labels for window
             if all(l == -100 for l in labels):
-                input_ids = (prompt_ids + resp_ids)[-self.seq_len:]
-                labels    = ([-100]*len(prompt_ids) + resp_ids)[-self.seq_len:]
+                window = (prompt_ids + resp_ids)[-self.seq_len:]
+                total_len = len(prompt_ids) + len(resp_ids)
+                start_idx = max(0, total_len - self.seq_len)
+                overlap_prompt = max(0, len(prompt_ids) - start_idx)
+                labels_win = [-100] * len(window)
+                start_t = max(0, overlap_prompt - 1)
+                for t in range(start_t, len(window) - 1):
+                    labels_win[t] = window[t + 1]
+                input_ids = window
+                labels    = labels_win
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -85,7 +107,21 @@ def collate_sft(batch: List[Dict[str, torch.Tensor]], pad_id: int, seq_len: int)
         y = b["labels"][:max_len]
         input_ids[i, :x.size(0)] = x
         labels[i,    :y.size(0)] = y
+    # Sanity check: ensure there is at least one supervised token in the batch
+    supervised = (labels != -100).sum().item()
+    if supervised == 0:
+        raise RuntimeError("SFT batch has 0 supervised tokens; check template/truncation!")
     return {"input_ids": input_ids, "labels": labels}
+
+
+class CollateSFT:
+    """Picklable collate function wrapper for DataLoader workers."""
+    def __init__(self, pad_id: int, seq_len: int):
+        self.pad_id = pad_id
+        self.seq_len = seq_len
+
+    def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        return collate_sft(batch, self.pad_id, self.seq_len)
 
 
 def make_alpaca_loaders(tokenizer: AutoTokenizer, seq_len: int, micro_batch_size: int,
@@ -105,17 +141,27 @@ def make_alpaca_loaders(tokenizer: AutoTokenizer, seq_len: int, micro_batch_size
     val_ds   = InstructPairDataset(ds_val,   tokenizer, seq_len)
 
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+    persistent = bool(num_workers and num_workers > 0)
+    prefetch = 1 if persistent else None
     train_loader = DataLoader(
-        train_ds, batch_size=micro_batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=False,
-        collate_fn=lambda b: collate_sft(b, pad_id, seq_len),
-        persistent_workers=False,
+        train_ds,
+        batch_size=micro_batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=False,
+        collate_fn=CollateSFT(pad_id, seq_len),
+        persistent_workers=persistent,
+        prefetch_factor=prefetch,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=micro_batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=False,
-        collate_fn=lambda b: collate_sft(b, pad_id, seq_len),
-        persistent_workers=False,
+        val_ds,
+        batch_size=micro_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=False,
+        collate_fn=CollateSFT(pad_id, seq_len),
+        persistent_workers=persistent,
+        prefetch_factor=prefetch,
     )
     return train_loader, val_loader
 
@@ -162,8 +208,35 @@ class ReduceLROnPlateauOnVal(pl.Callback):
             opt = trainer.optimizers[0]
             for pg in opt.param_groups:
                 pg["lr"] = max(self.min_lr, pg["lr"] * self.factor)
-            pl_module.log("lr_reduced_to", opt.param_groups[0]["lr"], prog_bar=True)
+            # Can't call self.log() here per PL; print instead
+            try:
+                new_lr = opt.param_groups[0]["lr"]
+                print(f"[SFT] LR reduced to {new_lr:.6g}")
+            except Exception:
+                pass
             self.bad = 0; self.cool = self.cooldown
+
+
+class EarlyStoppingWithWarmup(pl.callbacks.early_stopping.EarlyStopping):
+    """Early stopping that ignores validations until a warmup step threshold.
+
+    Useful for SFT where metrics may wobble initially or reach a low value and then
+    recover after scheduler adjustments. This delays early stopping decisions until
+    `min_steps` have elapsed.
+    """
+
+    def __init__(self, *args, min_steps: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._min_steps = int(max(0, min_steps))
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.global_step < self._min_steps:
+            # Skip early stopping check during warmup window
+            return
+        return super().on_validation_end(trainer, pl_module)
+
+
+# Removed StableCheckpointCopies; rely on a single ModelCheckpoint with save_last=True
 
 
 # =========================
@@ -179,6 +252,11 @@ def main(config_path="config.yaml"):
     tok = AutoTokenizer.from_pretrained(cfg["data"]["tokenizer_name"], use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token or tok.unk_token
+    # Silence HF long-sequence warnings; we handle truncation later
+    try:
+        tok.model_max_length = int(1e9)
+    except Exception:
+        pass
 
     # Data
     seq_len = cfg["training"]["seq_len"]
@@ -204,43 +282,126 @@ def main(config_path="config.yaml"):
     lit = LitCausalLM(cfg, tok)
     lit.net = GPTMini(mcfg)  # ensure module matches mcfg
 
-    # Optimizer & schedule: gentle for SFT
-    base_lr = cfg["training"].get("lr", 5e-5)
-    cfg["training"]["lr"] = base_lr  # reflect in hparams
-    optimizer = torch.optim.AdamW(
-        lit.parameters(),
-        lr=base_lr,
-        betas=tuple(cfg["training"]["betas"]),
-        eps=cfg["training"]["eps"],
-        weight_decay=cfg["training"]["weight_decay"],
-    )
-    max_steps = cfg["training"].get("max_steps", 1000)
-    warm = WarmupCosine(cfg["training"].get("warmup_ratio", 0.03), max_steps)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warm)
+    # Optionally initialize from a provided base pretraining checkpoint
+    def load_base_into_lit(lit_module: pl.LightningModule, base_ckpt_path: str):
+        try:
+            ckpt = torch.load(base_ckpt_path, map_location="cpu")
+            state = ckpt.get("state_dict", ckpt)
+            # Accept either 'net.*' keys (Lightning) or raw module keys
+            if any(k.startswith("net.") for k in state.keys()):
+                base_sd = {k.split("net.", 1)[1]: v for k, v in state.items() if k.startswith("net.")}
+            else:
+                base_sd = state
+            compat = lit_module.net.load_state_dict(base_sd, strict=False)
+            missing = len(getattr(compat, "missing_keys", []))
+            unexpected = len(getattr(compat, "unexpected_keys", []))
+            print(f"[SFT] Loaded base weights from {base_ckpt_path}: missing={missing}, unexpected={unexpected}")
+            return True
+        except Exception as e:
+            print(f"[SFT] WARNING: Failed to load base weights from {base_ckpt_path}: {e}")
+            return False
 
-    # Override Lightning's optimizer hook to use our SFT settings
-    lit.configure_optimizers = lambda: {
-        "optimizer": optimizer,
-        "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
-    }
+    base_ckpt = cfg["training"].get("base_ckpt_path", None)
+    if base_ckpt:
+        if os.path.exists(base_ckpt):
+            ok = load_base_into_lit(lit, base_ckpt)
+            if not ok:
+                print("[SFT] Proceeding without base initialization.")
+        else:
+            print(f"[SFT] WARNING: base_ckpt_path does not exist: {base_ckpt}")
+    else:
+        print("[SFT] WARNING: No base_ckpt_path provided; SFT may start from random init!")
+
+    # If no base_ckpt_path (or it failed), optionally allow interactive selection
+    resume_checkpoint = None
+    if not base_ckpt:
+        any_ckpt = discover_checkpoints()
+        if any_ckpt:
+            try:
+                if os.isatty(0):
+                    resume_checkpoint = select_checkpoint_interactively()
+                    if resume_checkpoint:
+                        print(f"[SFT] Will initialize from: {resume_checkpoint}")
+                    else:
+                        print("[SFT] Starting from scratch...")
+                else:
+                    resume_checkpoint = find_latest_checkpoint()
+                    if resume_checkpoint:
+                        print(f"[SFT] Non-interactive init from: {resume_checkpoint}")
+            except Exception as e:
+                print(f"[SFT] Checkpoint selection failed ({e}). Starting from scratch.")
+
+        if resume_checkpoint:
+            try:
+                ckpt = torch.load(resume_checkpoint, map_location="cpu")
+                state_dict = ckpt.get("state_dict", ckpt)
+                compat = lit.load_state_dict(state_dict, strict=False)
+                try:
+                    missing = len(getattr(compat, "missing_keys", []))
+                    unexpected = len(getattr(compat, "unexpected_keys", []))
+                    print(f"[SFT] Loaded weights (missing={missing}, unexpected={unexpected})")
+                except Exception:
+                    print("[SFT] Loaded weights from checkpoint.")
+            except Exception as e:
+                print(f"[SFT] Failed to load weights from {resume_checkpoint}: {e}")
+
+    # Optimizer & schedule: gentle for SFT
+    base_lr = float(cfg["training"].get("lr", 5e-5))
+    cfg["training"]["lr"] = base_lr  # reflect in hparams
+    # Parameter groups: apply weight decay to weights (ndim>=2), not to biases/norms
+    wd = float(cfg["training"]["weight_decay"])
+    betas = tuple(float(x) for x in cfg["training"]["betas"])
+    eps = float(cfg["training"]["eps"])
+    decay_params = []
+    nodecay_params = []
+    for n, p in lit.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2:
+            decay_params.append(p)
+        else:
+            nodecay_params.append(p)
+    optimizer = torch.optim.AdamW([
+        {"params": decay_params, "weight_decay": wd},
+        {"params": nodecay_params, "weight_decay": 0.0},
+    ], lr=base_lr, betas=betas, eps=eps)
+
+    # Unify scheduling: Warmup to base LR, then rely on Reduce-On-Plateau
+    # Do not attach a per-step LambdaLR to avoid overwriting plateau adjustments
+    lit.configure_optimizers = lambda: {"optimizer": optimizer}
 
     # Hardware
     accelerator = cfg["hardware"]["accelerator"]
     devices = cfg["hardware"]["devices"]
+    # Total training steps (used by ES warmup and validation cadence)
+    max_steps = int(cfg["training"].get("max_steps", 1000))
 
     # Callbacks
     from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
-    ckpt_dir = cfg["training"].get("ckpt_dir", "checkpoints")
+    ckpt_dir = cfg["training"].get("ckpt_dir", cfg["training"].get("checkpoint_dir", "checkpoints"))
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_cb = ModelCheckpoint(
         dirpath=ckpt_dir, filename="sft-best",
-        monitor="val_loss", mode="min", save_top_k=1, save_last=True
+        monitor="val_loss", mode="min", save_top_k=1, save_last=True,
+        auto_insert_metric_name=False,
     )
-    es_cfg  = cfg["training"].get("early_stopping", {"patience": 3, "min_delta": 0.0})
-    es_cb   = EarlyStopping(monitor="val_loss", mode="min",
-                            patience=es_cfg.get("patience", 3),
-                            min_delta=es_cfg.get("min_delta", 0.0),
-                            verbose=True)
+    es_cfg  = cfg["training"].get("early_stopping", {"enabled": True, "patience": 9, "min_delta": 0.001})
+    es_enabled = bool(es_cfg.get("enabled", True))
+    es_patience = int(es_cfg.get("patience", 9))
+    es_min_delta = float(es_cfg.get("min_delta", 0.001))
+    es_warm_frac = float(es_cfg.get("warmup_fraction", 0.3))  # ignore ES before this fraction of steps
+    es_min_steps = int(max_steps * max(0.0, min(1.0, es_warm_frac)))
+    es_cb   = None
+    if es_enabled:
+        es_cb = EarlyStoppingWithWarmup(
+            monitor="val_loss",
+            mode="min",
+            patience=es_patience,
+            min_delta=es_min_delta,
+            verbose=True,
+            min_steps=es_min_steps,
+            check_on_train_epoch_end=False,
+        )
     rop_cfg = cfg["training"].get("reduce_on_plateau", {"factor":0.5,"patience":2,"min_lr":1e-6,"cooldown":0,"threshold":0.0})
     rop_cb  = ReduceLROnPlateauOnVal(
         patience=rop_cfg.get("patience", 2),
@@ -252,31 +413,64 @@ def main(config_path="config.yaml"):
     )
     lr_mon  = LearningRateMonitor(logging_interval="step")
 
+    # Trainer settings
+    # Align validation and snapshot saving with the end of each epoch ("epic end").
+    # Define an epoch by optimizer steps using steps_per_epoch and grad_accum_steps.
+    steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 0) or 0)
+    grad_accum_steps = int(cfg["training"].get("grad_accum_steps", 1))
+    # Number of training batches (forward passes) per epoch
+    batches_per_epoch = steps_per_epoch * max(1, grad_accum_steps) if steps_per_epoch > 0 else None
+
+    callbacks_list = [
+        ckpt_cb,
+        rop_cb,
+        lr_mon,
+        WarmupLRCallback(int(cfg["training"].get("warmup_ratio", 0.03) * max_steps)),
+    ]
+    if es_cb is not None:
+        callbacks_list.insert(1, es_cb)
+
+    # Limit per-epoch batches to enforce the above epoch definition. If not provided,
+    # fall back to Lightning defaults or user override.
+    limit_batches_cfg = cfg["training"].get("limit_train_batches", None)
+    if batches_per_epoch is not None and batches_per_epoch > 0 and limit_batches_cfg is None:
+        limit_train_batches = batches_per_epoch
+    else:
+        limit_train_batches = limit_batches_cfg if limit_batches_cfg is not None else 1.0
+
+    # Compute max_epochs from desired total optimizer steps. This ensures validation happens
+    # exactly at the end of each logical epoch.
+    if steps_per_epoch and steps_per_epoch > 0:
+        max_epochs = int(math.ceil(max_steps / float(steps_per_epoch)))
+    else:
+        # Fallback: approximate 10 epochs across training if steps_per_epoch not set
+        approx_epochs = 10
+        steps_per_epoch = max(1, max_steps // approx_epochs)
+        batches_per_epoch = steps_per_epoch * max(1, grad_accum_steps)
+        if limit_train_batches is None:
+            limit_train_batches = batches_per_epoch
+        max_epochs = approx_epochs
+
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
         max_steps=max_steps,
+        max_epochs=max_epochs,
         precision=cfg["training"]["precision"],
         accumulate_grad_batches=cfg["training"]["grad_accum_steps"],
         log_every_n_steps=10,
         enable_checkpointing=True,
         gradient_clip_val=1.0,
-        val_check_interval=cfg["training"].get("eval_every", 100),
-        callbacks=[ckpt_cb, es_cb, rop_cb, lr_mon],
+        check_val_every_n_epoch=1,
+        limit_train_batches=limit_train_batches,
+        num_sanity_val_steps=0,
+        callbacks=callbacks_list,
     )
 
-    # Resume from a checkpoint if found
-    resume_ckpt = pick_checkpoint(ckpt_dir)
-    if resume_ckpt:
-        print(f"[SFT] Resuming from checkpoint: {resume_ckpt}")
-        trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=resume_ckpt)
-    else:
-        trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    # Start SFT training (do not pass ckpt_path; we've already loaded weights if selected)
+    trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    # Save final SFT checkpoint
-    final_path = os.path.join(ckpt_dir, "sft-final.ckpt")
-    trainer.save_checkpoint(final_path)
-    print(f"[SFT] Saved checkpoint to {final_path}")
+    # End-of-training: no extra copies; best and last are already maintained during training.
 
 
 if __name__ == "__main__":

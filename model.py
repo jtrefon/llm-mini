@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---- RMSNorm (lighter than LayerNorm; used by Llama/Mistral)
+# ---- RMSNorm (lighter than LayerNorm)
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5):
         super().__init__()
@@ -36,7 +36,7 @@ def build_rope_cache(seq_len: int, head_dim: int, base_theta: float, device, dty
     return sin, cos
 
 
-def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
+def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor, pos_offset: int = 0) -> torch.Tensor:
     """
     x: [B, T, H, D]
     sin, cos: [T, D/2]
@@ -49,8 +49,11 @@ def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.T
     x1 = x[..., 0]
     x2 = x[..., 1]
     # Broadcast sin/cos: [T, D/2] -> [1, T, 1, D/2]
-    sin_ = sin.to(torch.float32).view(1, T, 1, -1)
-    cos_ = cos.to(torch.float32).view(1, T, 1, -1)
+    # Support positional offset for incremental decoding
+    sin_slice = sin[pos_offset:pos_offset + T]
+    cos_slice = cos[pos_offset:pos_offset + T]
+    sin_ = sin_slice.to(torch.float32).view(1, T, 1, -1)
+    cos_ = cos_slice.to(torch.float32).view(1, T, 1, -1)
     # (x1, x2) rotated
     out1 = x1 * cos_ - x2 * sin_
     out2 = x1 * sin_ + x2 * cos_
@@ -86,55 +89,63 @@ class GQAMultiheadAttention(nn.Module):
         self.Wk = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.Wv = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.out = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        # Disable attention dropout by default; keep dropout in MLP/residual path
+        self.dropout = nn.Dropout(0.0)
 
-    def forward(self, x, causal=True, attn_mask=None, rope_sin=None, rope_cos=None, swa_window: int = 0):
-        # x: [B, T, C]
-        B, T, C = x.size()
-        q = self.Wq(x).view(B, T, self.n_heads, self.head_dim)
-        k = self.Wk(x).view(B, T, self.n_kv_heads, self.head_dim)
-        v = self.Wv(x).view(B, T, self.n_kv_heads, self.head_dim)
+    def forward(self, x, causal=True, attn_mask=None, rope_sin=None, rope_cos=None, swa_window: int = 0,
+                past_kv=None, pos_offset: int = 0, use_cache: bool = False):
+        # x: [B, Tq, C]
+        B, Tq, C = x.size()
+        q = self.Wq(x).view(B, Tq, self.n_heads, self.head_dim)
+        k = self.Wk(x).view(B, Tq, self.n_kv_heads, self.head_dim)
+        v = self.Wv(x).view(B, Tq, self.n_kv_heads, self.head_dim)
 
         if rope_sin is not None and rope_cos is not None:
-            q = apply_rope(q, rope_sin, rope_cos)
-            k = apply_rope(k, rope_sin, rope_cos)
+            q = apply_rope(q, rope_sin, rope_cos, pos_offset=pos_offset)
+            k = apply_rope(k, rope_sin, rope_cos, pos_offset=pos_offset)
+
+        # Append past KV if provided (cache stores KV-heads, unexpanded)
+        if past_kv is not None:
+            pk, pv = past_kv
+            if pk is not None and pv is not None:
+                # pk/pv: [B, Tk, H_kv, D]
+                k = torch.cat([pk, k], dim=1)
+                v = torch.cat([pv, v], dim=1)
+
+        # Optionally enforce sliding-window by trimming KV to the last W tokens
+        if swa_window and swa_window > 0:
+            Tk_total = k.size(1)
+            if Tk_total > swa_window:
+                k = k[:, -swa_window:, :, :]
+                v = v[:, -swa_window:, :, :]
 
         # Expand k,v from KV heads to Q heads (repeat per group)
-        if self.n_kv_heads != self.n_heads:
-            # [B,T,H_kv,D] -> repeat heads
-            k = k.repeat_interleave(self.group_size, dim=2)
-            v = v.repeat_interleave(self.group_size, dim=2)
+        k_expand = k.repeat_interleave(self.group_size, dim=2) if self.n_kv_heads != self.n_heads else k
+        v_expand = v.repeat_interleave(self.group_size, dim=2) if self.n_kv_heads != self.n_heads else v
 
         # SDPA expects [B*H, T, D]
-        q = q.permute(0, 2, 1, 3).reshape(B * self.n_heads, T, self.head_dim)
-        k = k.permute(0, 2, 1, 3).reshape(B * self.n_heads, T, self.head_dim)
-        v = v.permute(0, 2, 1, 3).reshape(B * self.n_heads, T, self.head_dim)
+        q_3d = q.permute(0, 2, 1, 3).reshape(B * self.n_heads, Tq, self.head_dim)
+        k_3d = k_expand.permute(0, 2, 1, 3).reshape(B * self.n_heads, k_expand.size(1), self.head_dim)
+        v_3d = v_expand.permute(0, 2, 1, 3).reshape(B * self.n_heads, v_expand.size(1), self.head_dim)
 
-
-        # Build causal/sliding window mask if needed. PyTorch SDPA can use attn_mask of shape [T, T] or [B*H, T, T]
+        # Build mask for training path (Tq==Tk) only; for cached decoding (Tq small, Tk large) we skip masks
         attn_mask_t = None
-        if causal or swa_window > 0:
-            # Causal base mask
+        if not use_cache and (causal or swa_window > 0):
+            T = Tq  # equals Tk in training path
             causal_mask = torch.ones(T, T, device=x.device, dtype=torch.bool).triu(1)
-            if swa_window > 0:
-                # Allow attention only to the last `swa_window` tokens (including self)
-                sw = torch.ones(T, T, device=x.device, dtype=torch.bool)
+            if swa_window and swa_window > 0:
                 idx = torch.arange(T, device=x.device)
-                sw &= (idx.view(-1,1) - idx.view(1,-1)) > 0  # start with strictly future
-                # Now, block positions older than window
-                older_than_w = (idx.view(-1,1) - idx.view(1,-1)) > swa_window
-                # Final mask = causal OR too-old
+                older_than_w = (idx.view(-1, 1) - idx.view(1, -1)) > swa_window
                 attn_mask_t = causal_mask | older_than_w
             else:
                 attn_mask_t = causal_mask
 
         # Attention: prefer manual math on MPS for stability; use SDPA elsewhere
         if x.device.type == 'mps':
-            # Compute in float32 to avoid NaNs
-            qf = q.to(torch.float32)
-            kf = k.to(torch.float32)
-            vf = v.to(torch.float32)
-            scores = torch.bmm(qf, kf.transpose(1, 2)) * (1.0 / math.sqrt(self.head_dim))  # [B*H, T, T]
+            qf = q_3d.to(torch.float32)
+            kf = k_3d.to(torch.float32)
+            vf = v_3d.to(torch.float32)
+            scores = torch.bmm(qf, kf.transpose(1, 2)) * (1.0 / math.sqrt(self.head_dim))  # [B*H, Tq, Tk]
             if attn_mask_t is not None:
                 mask = attn_mask_t
                 if mask.dim() == 2:
@@ -143,17 +154,22 @@ class GQAMultiheadAttention(nn.Module):
             weights = torch.softmax(scores, dim=-1)
             if self.training and self.dropout.p > 0:
                 weights = self.dropout(weights)
-            attn = torch.bmm(weights, vf).to(q.dtype)
+            attn = torch.bmm(weights, vf).to(q_3d.dtype)
         else:
             attn = F.scaled_dot_product_attention(
-                q, k, v,
+                q_3d, k_3d, v_3d,
                 attn_mask=attn_mask_t,
                 dropout_p=self.dropout.p if self.training else 0.0,
                 is_causal=False,
             )
 
-        attn = attn.reshape(B, self.n_heads, T, self.head_dim).permute(0, 2, 1, 3).contiguous().view(B, T, C)
-        return self.out(attn)
+        attn = attn.reshape(B, self.n_heads, Tq, self.head_dim).permute(0, 2, 1, 3).contiguous().view(B, Tq, C)
+        out = self.out(attn)
+
+        if use_cache:
+            # Return updated cache in KV-head space
+            return out, (k, v)
+        return out
 
 
 class TransformerBlock(nn.Module):
@@ -165,11 +181,19 @@ class TransformerBlock(nn.Module):
         self.mlp = SwiGLU(d_model, d_ff)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, rope_sin, rope_cos, swa_window: int = 0):
-        a = self.attn(self.norm1(x), causal=True, rope_sin=rope_sin, rope_cos=rope_cos, swa_window=swa_window)
-        x = x + self.dropout(a)
+    def forward(self, x, rope_sin, rope_cos, swa_window: int = 0, past_kv=None, pos_offset: int = 0, use_cache: bool = False):
+        if use_cache:
+            a, present_kv = self.attn(self.norm1(x), causal=True, rope_sin=rope_sin, rope_cos=rope_cos,
+                                       swa_window=swa_window, past_kv=past_kv, pos_offset=pos_offset,
+                                       use_cache=True)
+        else:
+            a = self.attn(self.norm1(x), causal=True, rope_sin=rope_sin, rope_cos=rope_cos, swa_window=swa_window)
+        # No dropout on attention residual to match common LLM practice
+        x = x + a
         m = self.mlp(self.norm2(x))
         x = x + self.dropout(m)
+        if use_cache:
+            return x, present_kv
         return x
 
 
@@ -215,11 +239,14 @@ class GPTMini(nn.Module):
             self._rope_cache_params = (seq_len, head_dim, theta)
         else:
             cached = self._rope_cache_params
-            if cached != (seq_len, head_dim, theta):
-                sin, cos = build_rope_cache(seq_len, head_dim, theta, device, rope_dtype)
+            # Grow-only cache: reuse if requested len <= cached len and settings match
+            cached_len, cached_hd, cached_theta = cached
+            if (head_dim != cached_hd) or (theta != cached_theta) or (seq_len > cached_len):
+                new_len = max(seq_len, cached_len)
+                sin, cos = build_rope_cache(new_len, head_dim, theta, device, rope_dtype)
                 self._rope_sin = sin
                 self._rope_cos = cos
-                self._rope_cache_params = (seq_len, head_dim, theta)
+                self._rope_cache_params = (new_len, head_dim, theta)
 
     def forward(self, input_ids: torch.Tensor):
         # input_ids: [B, T]
@@ -234,25 +261,117 @@ class GPTMini(nn.Module):
         return logits
 
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens=128, temperature=0.8, top_p=0.9, eos_token_id: Optional[int]=None):
+    def generate(self, input_ids: torch.Tensor,
+                 max_new_tokens: int = 128,
+                 temperature: float = 0.8,
+                 top_p: float = 0.9,
+                 top_k: int = 0,
+                 repetition_penalty: float = 1.0,
+                 eos_token_id: Optional[int] = None,
+                 no_repeat_ngram_size: int = 0,
+                 max_repeat_token_run: int = 3):
         self.eval()
-        B = input_ids.size(0)
         device = next(self.parameters()).device
         input_ids = input_ids.to(device)
+        B = input_ids.size(0)
+        assert B == 1, "generate with KV cache currently supports batch size 1"
+
+        # Build KV caches by stepping through the prompt one token at a time
+        caches = [None] * len(self.blocks)
+        head_dim = self.config.d_model // self.config.n_heads
+        total_len = int(input_ids.size(1))
+        last_logits = None
+        for t in range(total_len):
+            tok = input_ids[:, t:t+1]
+            h = self.tok_emb(tok)
+            self._maybe_build_rope(t + 1, head_dim, self.config.rope_theta, h.device, h.dtype)
+            for i, blk in enumerate(self.blocks):
+                past = caches[i]
+                h, present = blk(h, self._rope_sin, self._rope_cos, swa_window=self.config.swa_window,
+                                 past_kv=past, pos_offset=t, use_cache=True)
+                caches[i] = present
+            h = self.norm_f(h)
+            last_logits = self.lm_head(h)[:, -1, :]
+
+        generated = []
+        cur_len = total_len
         for _ in range(max_new_tokens):
-            logits = self.forward(input_ids)[:, -1, :]  # [B, vocab]
-            logits = logits / max(1e-8, temperature)
-            # nucleus sampling
+            temp_eps = 1e-8
+            scale = max(temp_eps, float(temperature))
+            logits = last_logits / scale
+
+            # Simple repetition penalty: downweight tokens already present in the sequence
+            if repetition_penalty != 1.0 and repetition_penalty > 0.0:
+                uniq = torch.unique(input_ids[0], sorted=False)
+                logits[0, uniq] = logits[0, uniq] / repetition_penalty
+
+            # Convert to probabilities
             probs = F.softmax(logits, dim=-1)
+
+            # Enforce simple no-repeat-ngram constraint (batch size = 1)
+            if no_repeat_ngram_size and no_repeat_ngram_size > 1:
+                seq = input_ids[0].tolist()
+                n = int(no_repeat_ngram_size)
+                if len(seq) >= n - 1:
+                    prefix = tuple(seq[-(n - 1):])
+                    banned = set()
+                    for i in range(len(seq) - n + 1):
+                        if tuple(seq[i:i + (n - 1)]) == prefix:
+                            banned.add(seq[i + (n - 1)])
+                    if banned:
+                        banned_idx = torch.tensor(list(banned), device=probs.device, dtype=torch.long)
+                        banned_idx = banned_idx[(banned_idx >= 0) & (banned_idx < probs.size(-1))]
+                        if banned_idx.numel() > 0:
+                            probs[0, banned_idx] = 0.0
+
+            # Prevent degenerate runs of the same token (e.g., "computer: computer:")
+            if max_repeat_token_run and max_repeat_token_run > 0 and input_ids.size(1) >= max_repeat_token_run:
+                last_tokens = input_ids[0, -max_repeat_token_run:]
+                if torch.all(last_tokens == last_tokens[-1]):
+                    probs[0, last_tokens[-1].item()] = 0.0
+
+            # Optional top-k filtering
+            if top_k and top_k > 0:
+                topk_vals, topk_idx = torch.topk(probs, k=min(top_k, probs.size(-1)), dim=-1)
+                mask = torch.zeros_like(probs)
+                mask.scatter_(1, topk_idx, topk_vals)
+                probs = mask
+
+            # Nucleus (top-p) filtering
             sorted_probs, sorted_idx = torch.sort(probs, descending=True)
             cum = torch.cumsum(sorted_probs, dim=-1)
-            mask = cum - sorted_probs > top_p
-            sorted_probs[mask] = 0
-            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-            next_idx = torch.multinomial(sorted_probs, num_samples=1)  # [B,1]
-            next_token = sorted_idx.gather(-1, next_idx)
+            cutoff = cum > top_p
+            cutoff[..., 0] = False
+            sorted_probs[cutoff] = 0
+            probs = torch.zeros_like(probs).scatter(1, sorted_idx, sorted_probs)
+            probs_sum = probs.sum(dim=-1, keepdim=True)
+            probs = probs / probs_sum.clamp_min(1e-12)
+
+            # If temperature==0 (greedy) or probabilities collapsed to zeros, fallback to argmax
+            if float(temperature) <= 0.0 or torch.any(~torch.isfinite(probs_sum)) or torch.all(probs_sum <= 0):
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                next_token = torch.multinomial(probs, num_samples=1)  # [B,1]
             input_ids = torch.cat([input_ids, next_token], dim=1)
-            if eos_token_id is not None:
-                if (next_token == eos_token_id).all():
-                    break
+            generated.append(next_token)
+
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+
+            # One-step forward with cache to get logits for next step
+            t = cur_len
+            h = self.tok_emb(next_token)
+            self._maybe_build_rope(t + 1, head_dim, self.config.rope_theta, h.device, h.dtype)
+            for i, blk in enumerate(self.blocks):
+                past = caches[i]
+                h, present = blk(h, self._rope_sin, self._rope_cos, swa_window=self.config.swa_window,
+                                 past_kv=past, pos_offset=t, use_cache=True)
+                caches[i] = present
+            h = self.norm_f(h)
+            last_logits = self.lm_head(h)[:, -1, :]
+            cur_len += 1
+
+        if generated:
+            gen_ids = torch.cat(generated, dim=1)
+            return torch.cat([input_ids[:, :total_len], gen_ids], dim=1)
         return input_ids

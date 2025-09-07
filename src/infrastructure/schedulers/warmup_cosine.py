@@ -39,33 +39,12 @@ class WarmupCosineScheduler:
                 progress = (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
                 return 0.5 * (1 + math.cos(math.pi * progress))
 
-        # Build an internal real optimizer for LambdaLR to avoid type errors
-        import torch
-        import torch.nn as nn
-        from torch.optim import SGD, Optimizer
-
-        # Determine base LRs from provided optimizer (mock or real)
-        base_param_groups = getattr(optimizer, 'param_groups', None)
-        if isinstance(base_param_groups, list) and base_param_groups and all('lr' in g for g in base_param_groups):
-            base_lrs = [float(g['lr']) for g in base_param_groups]
-        else:
-            base_lrs = [1e-3]
-
-        # Create param groups to mirror base_lrs
-        params = [nn.Parameter(torch.zeros(1, requires_grad=True)) for _ in base_lrs]
-        # Create one SGD with multiple param groups
-        if len(params) == 1:
-            internal_opt = SGD([{'params': params[0], 'lr': base_lrs[0]}])
-        else:
-            groups = [{'params': p, 'lr': lr} for p, lr in zip(params, base_lrs)]
-            internal_opt = SGD(groups)
-
-        self._internal_optimizer = internal_opt
-        self.scheduler = LambdaLR(self._internal_optimizer, lr_lambda)
+        # Attach scheduler directly to the provided optimizer so Lightning can validate the pairing
+        self.scheduler = LambdaLR(optimizer, lr_lambda)
 
     @property
-    def base_lrs(self):
-        return [g['lr'] for g in self._internal_optimizer.param_groups]
+    def base_lrs(self):  # pragma: no cover - passthrough to underlying scheduler
+        return self.scheduler.base_lrs
 
     def step(self):
         """Update learning rate for next step."""

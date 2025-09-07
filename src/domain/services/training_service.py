@@ -52,7 +52,7 @@ class TrainingService(ABC):
         Returns:
             TrainingResult with final model state and metrics
         """
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def resume_training(self, checkpoint_path: Path, additional_steps: int) -> TrainingResult:
@@ -65,7 +65,7 @@ class TrainingService(ABC):
         Returns:
             TrainingResult with final model state and metrics
         """
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def validate_configuration(self, model_config: ModelConfiguration,
@@ -79,7 +79,8 @@ class TrainingService(ABC):
         Raises:
             ValueError: If configuration is invalid or incompatible
         """
-        pass
+        pass  # pragma: no cover
+  # pragma: no cover
 
     @abstractmethod
     def get_training_status(self) -> dict:
@@ -88,4 +89,5 @@ class TrainingService(ABC):
         Returns:
             Dictionary with training status information
         """
-        pass
+        pass  # pragma: no cover
+  # pragma: no cover

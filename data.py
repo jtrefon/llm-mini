@@ -67,11 +67,16 @@ def load_text_dataset(name: str, split: str, text_field: str, streaming: bool=Fa
 
 
 def build_token_sequences(tokenizer, texts: Iterator[str], max_docs: int = 20000):
-    """Tokenize an iterator of texts into lists of token ids, capping doc count for laptop sanity."""
+    """Tokenize texts into lists of token ids, ensuring EOS between documents."""
     tokens: List[List[int]] = []
+    eos_id = getattr(tokenizer, 'eos_token_id', None)
     for i, t in enumerate(texts):
         enc = tokenizer(t, add_special_tokens=True, truncation=False)
-        tokens.append(enc['input_ids'])
+        ids = enc['input_ids']
+        # Ensure documents are terminated with EOS to prevent cross-doc leakage
+        if eos_id is not None and (len(ids) == 0 or ids[-1] != eos_id):
+            ids = ids + [eos_id]
+        tokens.append(ids)
         if (i + 1) >= max_docs:
             break
     return tokens

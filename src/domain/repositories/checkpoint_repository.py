@@ -60,7 +60,7 @@ class CheckpointRepository(ABC):
             CheckpointInfo for the checkpoint with highest step count,
             or None if no checkpoints exist.
         """
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def find_best_checkpoint(self) -> Optional[CheckpointInfo]:
@@ -70,7 +70,7 @@ class CheckpointRepository(ABC):
             CheckpointInfo for the checkpoint with lowest val_loss,
             or None if no checkpoints with validation loss exist.
         """
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def list_checkpoints(self) -> List[CheckpointInfo]:
@@ -79,7 +79,7 @@ class CheckpointRepository(ABC):
         Returns:
             List of CheckpointInfo objects, sorted by modification time (newest first).
         """
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def parse_checkpoint_metadata(self, path: Path) -> CheckpointInfo:
@@ -91,7 +91,7 @@ class CheckpointRepository(ABC):
         Returns:
             CheckpointInfo with parsed metadata from filename
         """
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def checkpoint_exists(self, path: Path) -> bool:
@@ -103,4 +103,4 @@ class CheckpointRepository(ABC):
         Returns:
             True if checkpoint exists, False otherwise
         """
-        pass
+        pass  # pragma: no cover

@@ -65,11 +65,12 @@ class ConfigLoader:
     def load_training_config(self) -> TrainingConfiguration:
         """Load and validate training configuration."""
         config_data = self._load_yaml()
-        training_data = config_data.get('training', {})
+        training_data = dict(config_data.get('training', {}))  # shallow copy we can mutate
 
         # Handle optional fields with defaults
         training_data.setdefault('steps_per_epoch', None)
         training_data.setdefault('gradient_clip_val', None)
+        training_data.setdefault('limit_val_batches', 1.0)
 
         # Coerce numeric fields that might come as strings in some YAML scenarios
         def _to_int(v):
@@ -96,7 +97,22 @@ class ConfigLoader:
         if 'betas' in training_data and training_data['betas'] is not None:
             training_data['betas'] = [float(b) for b in training_data['betas']]
 
-        return TrainingConfiguration(**training_data)
+        # Extract nested optional blocks that are not constructor args
+        early_stopping_cfg = training_data.pop('early_stopping', None)
+        _ = training_data.pop('reduce_on_plateau', None)  # not used in refactor; scheduler is WarmupCosine
+
+        cfg = TrainingConfiguration(**training_data)
+
+        # Attach optional early stopping attributes for callbacks factory
+        if isinstance(early_stopping_cfg, dict):
+            patience = early_stopping_cfg.get('patience', None)
+            min_delta = early_stopping_cfg.get('min_delta', None)
+            if patience is not None:
+                setattr(cfg, 'early_stopping_patience', int(patience))
+            if min_delta is not None:
+                setattr(cfg, 'early_stopping_min_delta', float(min_delta))
+
+        return cfg
 
     def load_hardware_config(self) -> HardwareConfig:
         """Load and validate hardware configuration."""

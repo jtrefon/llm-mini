@@ -11,3 +11,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# Import shared fixtures so they're available to all tests
+# This allows using fixtures from `tests/fixtures/conftest.py` project-wide
+try:
+    from tests.fixtures.conftest import *  # noqa: F401,F403
+except Exception:
+    # Keep tests importable even if fixtures module changes
+    pass

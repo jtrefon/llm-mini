@@ -14,9 +14,9 @@ training:
   seq_len: 1024           # Sequence length
   micro_batch_size: 1     # Micro batch size
   grad_accum_steps: 32    # effective batch = micro_batch * accum * devices
-  max_steps: 3000         # Maximum number of training steps
-  eval_every: 200         # not used when steps_per_epoch is set; kept for reference
-  save_every: 200         # Save every X steps
+  max_steps: 4000         # Maximum number of training steps
+  #eval_every: 4000         # not used when steps_per_epoch is set; kept for reference
+  save_every: 100         # Save every X steps
   lr: 2e-4                # learning rate, it's rate of change of loss with respect to parameters, 3e-4 is default  
   weight_decay: 0.1       # it's a regularization term that prevents overfitting, 0.1 is default
   betas: [0.9, 0.95]      # it's a hyperparameter which scale and shift normalized input
@@ -24,20 +24,24 @@ training:
   warmup_ratio: 0.01      # it's a hyperparameter which controls the amount of warmup steps
   precision: "32"         # it's a hyperparameter which controls the precision of the optimizer
   seed: 42                # it's a hyperparameter which controls the random seed
-  steps_per_epoch: 200    # align epoch length with desired validation cadence
+  steps_per_epoch: 100    # align epoch length with desired validation cadence
+  # Optional: set to a pretrained checkpoint to initialize SFT from
+  base_ckpt_path: null    # e.g., "checkpoints/final.ckpt" or leave null to skip
 
   # Learning-rate reduction on plateau (val_loss)
   reduce_on_plateau:
     factor: 0.5           # Factor by which the learning rate will be reduced
-    patience: 2           # Number of epochs with no improvement after which learning rate will be reduced
-    threshold: 0.0        # Threshold for measuring the new optimum, to only focus on significant changes
+    patience: 3           # Slightly longer patience for SFT stability
+    threshold: 0.001      # Ignore tiny noise-level changes
     cooldown: 0           # Number of epochs to wait before resuming normal operation after lr has been reduced
     min_lr: 1.0e-6        # Minimum learning rate
 
   # Early stopping on validation loss
   early_stopping:
-    patience: 5           # Number of epochs with no improvement after which training will be stopped
-    min_delta: 0.0        # Minimum change in the monitored quantity to qualify as an improvement
+    enabled: true         # Set false to disable early stopping entirely
+    patience: 9           # Number of validations with no improvement before stop
+    min_delta: 0.001      # Minimum improvement (absolute) to qualify as progress
+    warmup_fraction: 0.3  # Ignore early-stopping decisions in initial 30% of steps
 
 hardware:
   accelerator: "mps"      # "mps" on Apple Silicon; use "gpu" on 4090; "auto" also works
@@ -55,5 +59,5 @@ data:
   pack_sequences: true    # concatenate tokens and pack into fixed-length blocks
 
   # Dataset size configuration
-  train_docs: 20000       # Number of training documents
-  val_docs: 2000          # Number of validation documents (separate batch)
+  train_docs: 40000       # Number of training documents
+  val_docs: 4000          # Number of validation documents (separate batch)

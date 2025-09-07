@@ -52,15 +52,15 @@ class TestWarmupCosineScheduler:
         for _ in range(100):
             scheduler.step()
 
-        # At step 500 (middle of cosine decay)
-        for _ in range(400):
+        # At step 550 (middle of cosine decay: warmup=100, decay half-way at 100 + 0.5*(1000-100) = 550)
+        for _ in range(450):
             scheduler.step()
-        lr_at_500 = scheduler.scheduler.get_last_lr()[0]
+        lr_at_550 = scheduler.scheduler.get_last_lr()[0]
 
         # Cosine decay: 0.5 * (1 + cos(π * progress))
         # At 50% progress, cos(π * 0.5) = cos(π/2) = 0, so lr = 0.5 * base_lr
         expected_lr = 0.5 * 1e-3
-        assert abs(lr_at_500 - expected_lr) < 1e-5
+        assert abs(lr_at_550 - expected_lr) < 1e-5
 
     def test_scheduler_step_method(self):
         """Test scheduler step method."""

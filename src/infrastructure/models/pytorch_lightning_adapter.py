@@ -116,11 +116,13 @@ class PyTorchLightningGPTModel(pl.LightningModule):
 
         # Create scheduler using shared factory
         scheduler = create_warmup_cosine_scheduler(optimizer, self.training_config)
+        # Unwrap to a real torch.optim.lr_scheduler for Lightning compatibility
+        scheduler_obj = getattr(scheduler, 'scheduler', scheduler)
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
-                "scheduler": scheduler,
+                "scheduler": scheduler_obj,
                 "interval": "step",
                 "frequency": 1
             }

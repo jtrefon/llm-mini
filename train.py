@@ -15,7 +15,7 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from model import GPTMini, GPTConfig
 from data import make_dataloaders, get_tokenizer
 import glob
@@ -46,11 +46,12 @@ class EarlyStoppingRespectConfig(EarlyStopping):
     resets the wait counter so you don't immediately stop after resuming.
     """
 
-    def __init__(self, *args, configured_patience: int | None = None, reset_wait_on_resume: bool = True, **kwargs):
+    def __init__(self, *args, configured_patience: int | None = None, reset_wait_on_resume: bool = True, reset_best_on_resume: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         # Keep the configured patience regardless of what the checkpoint contains
         self._configured_patience = configured_patience if configured_patience is not None else self.patience
         self._reset_wait_on_resume = reset_wait_on_resume
+        self._reset_best_on_resume = reset_best_on_resume
         self.patience = self._configured_patience
 
     def load_state_dict(self, state_dict):
@@ -59,6 +60,12 @@ class EarlyStoppingRespectConfig(EarlyStopping):
         self.patience = self._configured_patience
         if self._reset_wait_on_resume:
             self.wait_count = 0
+        if self._reset_best_on_resume:
+            # Reset best score so patience counts from resume point
+            if self.mode == 'min':
+                self.best_score = torch.tensor(float('inf'), device=self.best_score.device)
+            else:
+                self.best_score = torch.tensor(float('-inf'), device=self.best_score.device)
 
 
 class LitCausalLM(pl.LightningModule):
@@ -105,18 +112,26 @@ class LitCausalLM(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = AdamW(
-            self.parameters(),
-            lr=float(self.cfg['training']['lr']),
-            betas=tuple(self.cfg['training']['betas']),
-            eps=float(self.cfg['training']['eps']),
-            weight_decay=float(self.cfg['training']['weight_decay'])
-        )
+        # Parameter groups: apply weight decay to weights (ndim>=2), not to biases/norms
+        wd = float(self.cfg['training']['weight_decay'])
+        lr = float(self.cfg['training']['lr'])
+        betas = tuple(self.cfg['training']['betas'])
+        eps = float(self.cfg['training']['eps'])
 
-        # Warmup + cosine decay per-step
-        max_steps = self.cfg['training']['max_steps']
-        warm = WarmupCosine(self.cfg['training']['warmup_ratio'], max_steps)
-        step_sched = LambdaLR(optimizer, lr_lambda=warm)
+        decay_params = []
+        nodecay_params = []
+        for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim >= 2:
+                decay_params.append(p)
+            else:
+                nodecay_params.append(p)
+
+        optimizer = AdamW([
+            {'params': decay_params, 'weight_decay': wd},
+            {'params': nodecay_params, 'weight_decay': 0.0},
+        ], lr=lr, betas=betas, eps=eps)
 
         # Reduce LR on plateau (monitor validation loss)
         r_cfg = self.cfg['training'].get('reduce_on_plateau', {})
@@ -132,11 +147,6 @@ class LitCausalLM(pl.LightningModule):
 
         scheds = [
             {
-                'scheduler': step_sched,
-                'interval': 'step',
-                'frequency': 1
-            },
-            {
                 'scheduler': plateau_sched,
                 'reduce_on_plateau': True,
                 'monitor': 'val_loss',
@@ -145,6 +155,40 @@ class LitCausalLM(pl.LightningModule):
             }
         ]
         return [optimizer], scheds
+
+
+class WarmupLRCallback(pl.Callback):
+    """Linearly warm up LR over first N steps without interfering with plateau scheduler.
+
+    It scales each param group lr from 0 -> base_lr across warmup_steps, then does nothing.
+    This avoids using a step-based scheduler that would override ReduceLROnPlateau.
+    """
+
+    def __init__(self, warmup_steps: int):
+        super().__init__()
+        self.warmup_steps = max(1, int(warmup_steps))
+        self.base_lrs = None
+
+    def on_fit_start(self, trainer, pl_module):
+        if not trainer.optimizers:
+            return
+        opt = trainer.optimizers[0]
+        # Capture target/base lrs
+        self.base_lrs = [g.get('lr', 0.0) for g in opt.param_groups]
+        # Start from near-zero to ramp smoothly
+        for g in opt.param_groups:
+            g['lr'] = 0.0
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if not trainer.optimizers or self.base_lrs is None:
+            return
+        step = trainer.global_step  # counts seen batches across fit
+        if step >= self.warmup_steps:
+            return  # Warmup done; do not touch LR further
+        frac = float(step + 1) / float(self.warmup_steps)
+        opt = trainer.optimizers[0]
+        for g, base in zip(opt.param_groups, self.base_lrs):
+            g['lr'] = base * frac
 
 
 def find_latest_checkpoint():
@@ -375,6 +419,19 @@ class MetricsLoggingCallback(pl.Callback):
         line += f" | lr={lr:.6f}" if isinstance(lr, (int, float)) else " | lr=-"
         self._append_line(line)
 
+    def on_train_epoch_start(self, trainer, pl_module):
+        # Log LR at the start of the new epoch, after any ReduceLROnPlateau step
+        lr = None
+        if trainer.optimizers:
+            try:
+                lr = trainer.optimizers[0].param_groups[0].get('lr', None)
+            except Exception:
+                pass
+        epoch = trainer.current_epoch
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f"{ts} | epoch={epoch} | train_loss=- | val_loss=- | lr={lr:.6f}" if isinstance(lr, (int, float)) else f"{ts} | epoch={epoch} | train_loss=- | val_loss=- | lr=-"
+        self._append_line(line)
+
     def _log_header(self):
         header = "timestamp | epoch | train_loss | val_loss | lr"
         self._append_line(header)
@@ -494,6 +551,7 @@ def main(config_path='config.yaml'):
         check_on_train_epoch_end=False,
         configured_patience=es_cfg.get('patience', cfg['training']['early_stopping']['patience']),
         reset_wait_on_resume=True,
+        reset_best_on_resume=True,
         verbose=True,
     )
 
@@ -516,6 +574,12 @@ def main(config_path='config.yaml'):
 
     if steps_per_epoch is not None:
         trainer_kwargs['limit_train_batches'] = steps_per_epoch
+
+    # Add warmup callback that doesn't conflict with plateau
+    max_steps = cfg['training']['max_steps']
+    warmup_steps = max(1, int(cfg['training']['warmup_ratio'] * max_steps))
+    warmup_cb = WarmupLRCallback(warmup_steps)
+    trainer_kwargs['callbacks'].append(warmup_cb)
 
     trainer = pl.Trainer(**trainer_kwargs)
 
