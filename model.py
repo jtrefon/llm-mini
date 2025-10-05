@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # ---- RMSNorm (lighter than LayerNorm)
@@ -209,6 +210,7 @@ class GPTConfig:
     rope_theta: float = 1000000.0
     tie_embeddings: bool = True
     swa_window: int = 0
+    gradient_checkpointing: bool = False
 
 
 class GPTMini(nn.Module):
@@ -254,8 +256,19 @@ class GPTMini(nn.Module):
         h = self.tok_emb(input_ids)  # [B,T,C]
         head_dim = self.config.d_model // self.config.n_heads
         self._maybe_build_rope(T, head_dim, self.config.rope_theta, h.device, h.dtype)
+        use_ckpt = bool(getattr(self.config, 'gradient_checkpointing', False)) and self.training
         for i, blk in enumerate(self.blocks):
-            h = blk(h, self._rope_sin, self._rope_cos, swa_window=self.config.swa_window)
+            if use_ckpt:
+                # Wrap block forward with checkpoint to save activation memory
+                def fn(x):
+                    return blk(x, self._rope_sin, self._rope_cos, swa_window=self.config.swa_window)
+                try:
+                    h = checkpoint(fn, h, use_reentrant=False)
+                except TypeError:
+                    # Fallback for older torch versions without use_reentrant
+                    h = checkpoint(fn, h)
+            else:
+                h = blk(h, self._rope_sin, self._rope_cos, swa_window=self.config.swa_window)
         h = self.norm_f(h)
         logits = self.lm_head(h)
         return logits

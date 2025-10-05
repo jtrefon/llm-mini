@@ -58,8 +58,19 @@ def load_from_lightning_ckpt(ckpt_path: str, tokenizer_name: str, device: str = 
     model.eval()
     return model, tokenizer, dev
 
+def compute_ppl(model, tokenizer, device, text):
+    inputs = tokenizer(text, return_tensors='pt').to(device)
+    with torch.no_grad():
+        logits = model(inputs['input_ids']).logits
+    labels = inputs['input_ids']
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss_fct = torch.nn.CrossEntropyLoss()
+    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    return torch.exp(loss).item()
 
-def generate_text(model, tokenizer, device, prompt: str, max_new_tokens=128, temperature=0.8, top_p=0.9, top_k: int = 0, repetition_penalty: float = 1.0, no_repeat_ngram_size: int = 0):
+
+def generate_text(model, tokenizer, device, prompt: str, max_new_tokens=128, temperature=0.2, top_p=0.9, top_k: int = 0, repetition_penalty: float = 1.0, no_repeat_ngram_size: int = 0, beam_width=1):
     inputs = tokenizer(prompt, return_tensors='pt').to(device)
     with torch.no_grad():
         out_ids = model.generate(
@@ -113,11 +124,13 @@ if __name__ == '__main__':
     parser.add_argument('--prompt', type=str, default='Once upon a time')
     parser.add_argument('--instruct', action='store_true', help='Force-wrap the prompt in an Alpaca-style template (auto-detected otherwise).')
     parser.add_argument('--max_new_tokens', type=int, default=128)
-    parser.add_argument('--temperature', type=float, default=0.8)
+    parser.add_argument('--temperature', type=float, default=0.2)
     parser.add_argument('--top_p', type=float, default=0.9)
     parser.add_argument('--top_k', type=int, default=0)
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--no_repeat_ngram_size', type=int, default=3, help='Prevent repeating any n-gram of this size (0 to disable).')
+    parser.add_argument('--beam_width', type=int, default=1, help='Beam search width (1 for greedy)')
+    parser.add_argument('--compute_ppl', action='store_true', help='Compute perplexity on generated text')
     parser.add_argument('--seed', type=int, default=None)
     args = parser.parse_args()
 
@@ -145,6 +158,10 @@ if __name__ == '__main__':
         top_k=args.top_k,
         repetition_penalty=args.repetition_penalty,
         no_repeat_ngram_size=max(0, args.no_repeat_ngram_size),
+        beam_width=args.beam_width,
     )
     print('\n=== Generation ===\n')
     print(text)
+    if args.compute_ppl:
+        ppl = compute_ppl(model, tok, dev, args.prompt + text)
+        print(f'PPL: {ppl:.2f}')

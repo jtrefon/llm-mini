@@ -21,6 +21,15 @@ from data import make_dataloaders, get_tokenizer
 import glob
 import warnings
 
+# Optional: small perf tweaks when available
+try:
+    import torch
+    torch.set_float32_matmul_precision("high")
+    if torch.backends.cuda is not None:
+        torch.backends.cuda.matmul.allow_tf32 = True
+except Exception:
+    pass
+
 
 class WarmupCosine:
     def __init__(self, warmup_ratio: float, max_steps: int):
@@ -35,23 +44,33 @@ class WarmupCosine:
 
 
 class EarlyStoppingRespectConfig(EarlyStopping):
-    """EarlyStopping that preserves patience from config on resume.
+    """EarlyStopping that preserves patience from config on resume and can ignore
+    early validations until a minimum number of steps (warmup) has passed.
 
     PyTorch Lightning restores callback state from checkpoints, including the
     "patience" and current "wait_count". If the checkpoint was created with a
     different patience (e.g., 3) and you later increase it in config (e.g., 5),
     the restored state would override your new value and stop too early.
 
-    This subclass keeps the configured patience across resume, and optionally
-    resets the wait counter so you don't immediately stop after resuming.
+    This subclass keeps the configured patience across resume, can reset counters,
+    and supports a "min_steps" warmup window during which early stopping is disabled.
     """
 
-    def __init__(self, *args, configured_patience: int | None = None, reset_wait_on_resume: bool = True, reset_best_on_resume: bool = True, **kwargs):
+    def __init__(
+        self,
+        *args,
+        configured_patience: int | None = None,
+        reset_wait_on_resume: bool = True,
+        reset_best_on_resume: bool = True,
+        min_steps: int = 0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         # Keep the configured patience regardless of what the checkpoint contains
         self._configured_patience = configured_patience if configured_patience is not None else self.patience
         self._reset_wait_on_resume = reset_wait_on_resume
         self._reset_best_on_resume = reset_best_on_resume
+        self._min_steps = int(max(0, min_steps))
         self.patience = self._configured_patience
 
     def load_state_dict(self, state_dict):
@@ -66,6 +85,12 @@ class EarlyStoppingRespectConfig(EarlyStopping):
                 self.best_score = torch.tensor(float('inf'), device=self.best_score.device)
             else:
                 self.best_score = torch.tensor(float('-inf'), device=self.best_score.device)
+
+    def on_validation_end(self, trainer, pl_module):
+        # Skip early stopping decisions during the warmup window
+        if trainer.global_step < self._min_steps:
+            return
+        return super().on_validation_end(trainer, pl_module)
 
 
 class LitCausalLM(pl.LightningModule):
@@ -84,9 +109,16 @@ class LitCausalLM(pl.LightningModule):
             dropout=cfg['model']['dropout'],
             rope_theta=cfg['model']['rope_theta'],
             tie_embeddings=cfg['model']['tie_embeddings'],
-            swa_window=cfg['model']['swa_window']
+            swa_window=cfg['model']['swa_window'],
+            gradient_checkpointing=bool(cfg['model'].get('gradient_checkpointing', False)),
         )
         self.net = GPTMini(mcfg)
+        # Cap model size ~150M params for <2GB limit
+        param_count = sum(p.numel() for p in self.net.parameters())
+        if param_count > 200_000_000:
+            raise ValueError(f"Model param count {param_count/1e6:.1f}M exceeds 200M cap")
+        print("Model initialized with {} parameters".format(param_count))
+        print("Model initialized with {} parameters".format(param_count))
 
     def forward(self, input_ids):
         return self.net(input_ids)
@@ -108,7 +140,11 @@ class LitCausalLM(pl.LightningModule):
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)), labels.view(-1)
         )
+        if torch.isnan(loss) or torch.isinf(loss):
+            loss = torch.tensor(10.0)
         self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
+        ppl = torch.exp(loss)
+        self.log('val_ppl', ppl, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(self):
@@ -133,28 +169,62 @@ class LitCausalLM(pl.LightningModule):
             {'params': nodecay_params, 'weight_decay': 0.0},
         ], lr=lr, betas=betas, eps=eps)
 
-        # Reduce LR on plateau (monitor validation loss)
-        r_cfg = self.cfg['training'].get('reduce_on_plateau', {})
-        plateau_sched = ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=float(r_cfg.get('factor', self.cfg['training']['reduce_on_plateau']['factor'])),
-            patience=r_cfg.get('patience', self.cfg['training']['reduce_on_plateau']['patience']),
-            threshold=float(r_cfg.get('threshold', self.cfg['training']['reduce_on_plateau']['threshold'])),
-            cooldown=r_cfg.get('cooldown', self.cfg['training']['reduce_on_plateau']['cooldown']),
-            min_lr=float(r_cfg.get('min_lr', self.cfg['training']['reduce_on_plateau']['min_lr'])),
-        )
+        # Return only the optimizer. LR warmup and on-plateau reductions are handled by callbacks
+        # to avoid conflicts between step and epoch schedulers.
+        return optimizer
 
-        scheds = [
-            {
-                'scheduler': plateau_sched,
-                'reduce_on_plateau': True,
-                'monitor': 'val_loss',
-                'interval': 'epoch',
-                'frequency': 1
-            }
-        ]
-        return [optimizer], scheds
+ 
+class ReduceLROnPlateauOnVal(pl.Callback):
+    """Reduce LR when val_loss plateaus (uses config thresholds) without conflicting with warmup.
+
+    Operates purely as a callback modifying optimizer.param_groups, so no scheduler state
+    interferes with manual warmup logic.
+    """
+    def __init__(self, patience=2, factor=0.5, min_lr=1e-6, cooldown=0, threshold=0.0,
+                 monitor="val_loss", mode="min", warmup_steps: int = 0):
+        self.patience = int(patience)
+        self.factor = float(factor)
+        self.min_lr = float(min_lr)
+        self.cooldown = int(cooldown)
+        self.threshold = float(threshold)
+        self.monitor = monitor
+        self.mode = mode
+        self.best = float("inf") if mode == "min" else -float("inf")
+        self.bad = 0
+        self.cool = 0
+        self._warmup_steps = int(max(0, warmup_steps))
+
+    def _improved(self, cur: float) -> bool:
+        return (self.best - cur) > self.threshold if self.mode == "min" else (cur - self.best) > self.threshold
+
+    def on_validation_end(self, trainer, pl_module):
+        # Skip LR reductions during warmup window, to avoid fighting warmup callback
+        if trainer.global_step < self._warmup_steps:
+            return
+        if self.monitor not in trainer.callback_metrics:
+            return
+        cur = float(trainer.callback_metrics[self.monitor])
+        if self._improved(cur):
+            self.best = cur
+            self.bad = 0
+            if self.cool > 0:
+                self.cool -= 1
+            return
+        self.bad += 1
+        if self.cool > 0:
+            self.cool -= 1
+            return
+        if self.bad > self.patience and trainer.optimizers:
+            opt = trainer.optimizers[0]
+            for pg in opt.param_groups:
+                pg["lr"] = max(self.min_lr, pg["lr"] * self.factor)
+            try:
+                new_lr = opt.param_groups[0]["lr"]
+                print(f"[Train] LR reduced to {new_lr:.6g}")
+            except Exception:
+                pass
+            self.bad = 0
+            self.cool = self.cooldown
 
 
 class WarmupLRCallback(pl.Callback):
@@ -175,9 +245,17 @@ class WarmupLRCallback(pl.Callback):
         opt = trainer.optimizers[0]
         # Capture target/base lrs
         self.base_lrs = [g.get('lr', 0.0) for g in opt.param_groups]
-        # Start from near-zero to ramp smoothly
-        for g in opt.param_groups:
-            g['lr'] = 0.0
+        # Initialize LR based on current global step (handles resume correctly)
+        step = getattr(trainer, 'global_step', 0)
+        if step >= self.warmup_steps:
+            # Warmup already complete; set to base LR immediately
+            for g, base in zip(opt.param_groups, self.base_lrs):
+                g['lr'] = base
+        else:
+            # Start from a fraction according to current step
+            frac = float(step) / float(self.warmup_steps) if self.warmup_steps > 0 else 1.0
+            for g, base in zip(opt.param_groups, self.base_lrs):
+                g['lr'] = base * frac
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         if not trainer.optimizers or self.base_lrs is None:
@@ -402,6 +480,7 @@ class MetricsLoggingCallback(pl.Callback):
         metrics = trainer.callback_metrics
         train_loss = metrics.get('train_loss_epoch')
         val_loss = metrics.get('val_loss')
+        val_ppl  = metrics.get('val_ppl')
         # Current LR from first optimizer param group
         lr = None
         if trainer.optimizers:
@@ -416,6 +495,7 @@ class MetricsLoggingCallback(pl.Callback):
             f" | train_loss={float(train_loss):.4f}" if train_loss is not None else f"{ts} | epoch={epoch} | train_loss=-"
         )
         line += f" | val_loss={float(val_loss):.4f}" if val_loss is not None else " | val_loss=-"
+        line += f" | val_ppl={float(val_ppl):.4f}" if val_ppl is not None else " | val_ppl=-"
         line += f" | lr={lr:.6f}" if isinstance(lr, (int, float)) else " | lr=-"
         self._append_line(line)
 
@@ -472,15 +552,19 @@ def main(config_path='config.yaml'):
     tokenizer = get_tokenizer(cfg)
     train_loader, val_loader = make_dataloaders(cfg, tokenizer)
 
-    # Debug: Check if validation loader has data
-    print(f"Training dataset size: {len(train_loader.dataset)} sequences")
-    print(f"Validation dataset size: {len(val_loader.dataset)} sequences")
-
-    if len(val_loader.dataset) == 0:
-        print("!  Warning: Validation dataset is empty!")
-        print("? Consider reducing train_docs or increasing val_docs in config.yaml")
+    # Debug: Check dataset availability (supports streaming datasets without __len__)
+    try:
+        print(f"Training dataset size: {len(train_loader.dataset)} sequences")
+    except Exception:
+        print("Training dataset size: streaming/unknown")
+    try:
+        print(f"Validation dataset size: {len(val_loader.dataset)} sequences")
+    except Exception:
+        print("Validation dataset size: streaming/unknown")
 
     lit = LitCausalLM(cfg, tokenizer)
+    print("Model initialized with {} parameters".format(sum(p.numel() for p in lit.parameters())))
+
 
     # File logging
     log_file = setup_logging()
@@ -541,8 +625,10 @@ def main(config_path='config.yaml'):
             auto_insert_metric_name=False,
         )
 
-    # Early stopping on validation loss, evaluated after validation not train epoch end
+    # Early stopping on validation loss, with warmup gating
     es_cfg = cfg['training'].get('early_stopping', {})
+    es_warm_frac = float(es_cfg.get('warmup_fraction', 0.0))
+    es_min_steps = int(max(0.0, min(1.0, es_warm_frac)) * cfg['training']['max_steps'])
     early_stop_cb = EarlyStoppingRespectConfig(
         monitor='val_loss',
         mode='min',
@@ -552,7 +638,22 @@ def main(config_path='config.yaml'):
         configured_patience=es_cfg.get('patience', cfg['training']['early_stopping']['patience']),
         reset_wait_on_resume=True,
         reset_best_on_resume=True,
+        min_steps=es_min_steps,
         verbose=True,
+    )
+
+    # Reduce-on-plateau LR as a callback (avoid conflicts with warmup)
+    rop_cfg = cfg['training'].get('reduce_on_plateau', {})
+    warmup_steps_cb = max(1, int(cfg['training'].get('warmup_ratio', 0.0) * cfg['training']['max_steps']))
+    rop_cb = ReduceLROnPlateauOnVal(
+        patience=rop_cfg.get('patience', cfg['training']['reduce_on_plateau']['patience']),
+        factor=rop_cfg.get('factor', cfg['training']['reduce_on_plateau']['factor']),
+        min_lr=rop_cfg.get('min_lr', cfg['training']['reduce_on_plateau']['min_lr']),
+        cooldown=rop_cfg.get('cooldown', cfg['training']['reduce_on_plateau']['cooldown']),
+        threshold=rop_cfg.get('threshold', cfg['training']['reduce_on_plateau']['threshold']),
+        monitor='val_loss',
+        mode='min',
+        warmup_steps=warmup_steps_cb,
     )
 
     # Optionally cap steps per epoch to sync with validation cadence
@@ -565,17 +666,24 @@ def main(config_path='config.yaml'):
         precision=cfg['training']['precision'],
         accumulate_grad_batches=cfg['training']['grad_accum_steps'],
         log_every_n_steps=cfg['training'].get('log_every_n_steps', 10),
-        logger=False,  # Disable logging to avoid TensorBoard warnings
+        logger=pl.loggers.CSVLogger("logs"),  # Enable CSV logging for progress
         enable_checkpointing=True,
-        callbacks=[c for c in [checkpoint_cb, step_checkpoint_cb, early_stop_cb, metrics_logger_cb] if c is not None],
+        callbacks=[c for c in [checkpoint_cb, step_checkpoint_cb, early_stop_cb, rop_cb, metrics_logger_cb] if c is not None],
         gradient_clip_val=cfg['training'].get('gradient_clip_val', 1.0),
         limit_val_batches=cfg['training'].get('limit_val_batches', 1.0),   # Use full validation set
+        num_sanity_val_steps=0,
     )
 
     if steps_per_epoch is not None:
-        trainer_kwargs['limit_train_batches'] = steps_per_epoch
+        try:
+            grad_accum = int(cfg['training'].get('grad_accum_steps', 1))
+        except Exception:
+            grad_accum = 1
+        # Interpret steps_per_epoch as optimizer steps per epoch.
+        # Convert to number of training batches to feed the Trainer.
+        trainer_kwargs['limit_train_batches'] = int(steps_per_epoch) * max(1, grad_accum)
 
-    # Add warmup callback that doesn't conflict with plateau
+    # Add warmup callback that ramps LR linearly for the first N optimizer steps
     max_steps = cfg['training']['max_steps']
     warmup_steps = max(1, int(cfg['training']['warmup_ratio'] * max_steps))
     warmup_cb = WarmupLRCallback(warmup_steps)
@@ -583,12 +691,14 @@ def main(config_path='config.yaml'):
 
     trainer = pl.Trainer(**trainer_kwargs)
 
+    print("Starting training...")
     trainer.fit(
         lit,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
         ckpt_path=resume_checkpoint  # This will resume from checkpoint if provided
     )
+    print("Training completed.")
 
     # Save final checkpoint
     os.makedirs(ckpt_dir, exist_ok=True)

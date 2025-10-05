@@ -19,6 +19,26 @@ from train import (
     find_latest_checkpoint,
 )  # reuse your existing LightningModule & checkpoint utilities
 
+class LitSFT(LitCausalLM):
+    def validation_step(self, batch, batch_idx):
+        input_ids = batch['input_ids']
+        labels = batch['labels']
+        logits = self(input_ids)
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)), labels.view(-1)
+        )
+        self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
+        ppl = torch.exp(loss)
+        self.log('val_ppl', ppl, prog_bar=True, on_step=False, on_epoch=True)
+        # Instruction-specific metric: accuracy on non-ignored labels
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        pred = shift_logits.argmax(dim=-1)
+        mask = shift_labels != -100
+        acc = (pred == shift_labels)[mask].float().mean()
+        self.log('val_acc', acc, prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
 # ---- Nice-to-haves for CUDA/MPS
 try:
     torch.set_float32_matmul_precision("medium")
@@ -279,7 +299,7 @@ def main(config_path="config.yaml"):
         tie_embeddings=cfg["model"]["tie_embeddings"],
         swa_window=cfg["model"]["swa_window"],
     )
-    lit = LitCausalLM(cfg, tok)
+    lit = LitSFT(cfg, tok)
     lit.net = GPTMini(mcfg)  # ensure module matches mcfg
 
     # Optionally initialize from a provided base pretraining checkpoint
@@ -302,51 +322,17 @@ def main(config_path="config.yaml"):
             return False
 
     base_ckpt = cfg["training"].get("base_ckpt_path", None)
-    if base_ckpt:
-        if os.path.exists(base_ckpt):
-            ok = load_base_into_lit(lit, base_ckpt)
-            if not ok:
-                print("[SFT] Proceeding without base initialization.")
-        else:
-            print(f"[SFT] WARNING: base_ckpt_path does not exist: {base_ckpt}")
-    else:
-        print("[SFT] WARNING: No base_ckpt_path provided; SFT may start from random init!")
-
-    # If no base_ckpt_path (or it failed), optionally allow interactive selection
-    resume_checkpoint = None
     if not base_ckpt:
-        any_ckpt = discover_checkpoints()
-        if any_ckpt:
-            try:
-                if os.isatty(0):
-                    resume_checkpoint = select_checkpoint_interactively()
-                    if resume_checkpoint:
-                        print(f"[SFT] Will initialize from: {resume_checkpoint}")
-                    else:
-                        print("[SFT] Starting from scratch...")
-                else:
-                    resume_checkpoint = find_latest_checkpoint()
-                    if resume_checkpoint:
-                        print(f"[SFT] Non-interactive init from: {resume_checkpoint}")
-            except Exception as e:
-                print(f"[SFT] Checkpoint selection failed ({e}). Starting from scratch.")
+        raise ValueError("[SFT] training.base_ckpt_path must point to a pretrained checkpoint before fine-tuning")
+    if not os.path.exists(base_ckpt):
+        raise FileNotFoundError(f"[SFT] base_ckpt_path does not exist: {base_ckpt}")
 
-        if resume_checkpoint:
-            try:
-                ckpt = torch.load(resume_checkpoint, map_location="cpu")
-                state_dict = ckpt.get("state_dict", ckpt)
-                compat = lit.load_state_dict(state_dict, strict=False)
-                try:
-                    missing = len(getattr(compat, "missing_keys", []))
-                    unexpected = len(getattr(compat, "unexpected_keys", []))
-                    print(f"[SFT] Loaded weights (missing={missing}, unexpected={unexpected})")
-                except Exception:
-                    print("[SFT] Loaded weights from checkpoint.")
-            except Exception as e:
-                print(f"[SFT] Failed to load weights from {resume_checkpoint}: {e}")
+    ok = load_base_into_lit(lit, base_ckpt)
+    if not ok:
+        raise RuntimeError(f"[SFT] Failed to load base weights from {base_ckpt}")
 
     # Optimizer & schedule: gentle for SFT
-    base_lr = float(cfg["training"].get("lr", 5e-5))
+    base_lr = float(cfg["training"].get("lr", 1e-5))
     cfg["training"]["lr"] = base_lr  # reflect in hparams
     # Parameter groups: apply weight decay to weights (ndim>=2), not to biases/norms
     wd = float(cfg["training"]["weight_decay"])

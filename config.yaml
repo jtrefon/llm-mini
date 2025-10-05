@@ -9,20 +9,21 @@ model:
   rope_theta: 1000000     # RoPE base; larger supports longer context
   tie_embeddings: true    # Tie embeddings to prevent overfitting
   swa_window: 0           # set >0 to enable Sliding-Window Attention (tokens can attend last W)
+  gradient_checkpointing: true   # enable to reduce activation memory (slightly slower, much lower RAM)
 
 training:
   seq_len: 1024           # Sequence length
   micro_batch_size: 1     # Micro batch size
-  grad_accum_steps: 32    # effective batch = micro_batch * accum * devices
-  max_steps: 4000         # Maximum number of training steps
+  grad_accum_steps: 64    # effective batch = micro_batch * accum * devices
+  max_steps: 20000        # Maximum number of training steps
   #eval_every: 4000         # not used when steps_per_epoch is set; kept for reference
   save_every: 100         # Save every X steps
-  lr: 2e-4                # learning rate, it's rate of change of loss with respect to parameters, 3e-4 is default  
+  lr: 3.0e-4              # tuned lower for stability with ~64 sequence effective batch
   weight_decay: 0.1       # it's a regularization term that prevents overfitting, 0.1 is default
   betas: [0.9, 0.95]      # it's a hyperparameter which scale and shift normalized input
   eps: 1.0e-8             # it's a hyperparameter which prevents division by zero
-  warmup_ratio: 0.01      # it's a hyperparameter which controls the amount of warmup steps
-  precision: "32"         # it's a hyperparameter which controls the precision of the optimizer
+  warmup_ratio: 0.02      # it's a hyperparameter which controls the amount of warmup steps
+  precision: "32"        # it's a hyperparameter which controls the precision of the optimizer
   seed: 42                # it's a hyperparameter which controls the random seed
   steps_per_epoch: 100    # align epoch length with desired validation cadence
   # Optional: set to a pretrained checkpoint to initialize SFT from
@@ -46,18 +47,20 @@ training:
 hardware:
   accelerator: "mps"      # "mps" on Apple Silicon; use "gpu" on 4090; "auto" also works
   devices: 1
-  num_workers: 2
+  num_workers: 0         # on MPS prefer 0 to reduce host memory; increase on CUDA if memory allows
 
 # Dataset options. Start with a preprocessed, manageable corpus.
 data:
-  dataset: "shahrukhx01/wikipedia-bookscorpus-en-preprocessed"
+  dataset: "wikimedia/wikipedia"
   split: "train"
+  val_split: "train"      # set to a separate split (e.g. "validation") when available
   text_field: "text"
-  streaming: false        # memory-mapped Arrow; set true for huge corpora
+  streaming: true        # memory-mapped Arrow; set true for huge corpora
   tokenizer_name: "gpt2"  # change to a Llama tokenizer later if you have access
-  max_shards: null        # optional: limit shards/rows for quick smoke tests
+  max_shards: 100        # optional: limit shards/rows for quick smoke tests
   pack_sequences: true    # concatenate tokens and pack into fixed-length blocks
 
   # Dataset size configuration
-  train_docs: 40000       # Number of training documents
-  val_docs: 4000          # Number of validation documents (separate batch)
+  train_docs: 70000     # Number of training documents
+  val_docs: 1000        # Number of validation documents (separate batch)
+  config: "20231101.en"  # Dataset config for English Wikipedia
