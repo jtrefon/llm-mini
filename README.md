@@ -1,42 +1,90 @@
-# Tiny Transformer Starter (MBP\u2011friendly)
+# Tiny Transformer Starter (MBP‑friendly)
 
-A clean, from\u2011scratch, decoder\u2011only Transformer with **RMSNorm + RoPE + GQA + SwiGLU**, built for a **MacBook M\u2011series (MPS)** first run. Uses **PyTorch Lightning** for painless training. Later, move to an RTX 4090 and crank depth/context & FlashAttention.
+A clean, from‑scratch, decoder‑only Transformer with **RMSNorm + RoPE + GQA + SwiGLU**, built for a **MacBook M‑series (MPS)** first run. Uses **PyTorch Lightning** for painless training. Easy, hackable, and ready to scale.
+
+## Features
+
+- **Architecture**: Modern Llama-style components.
+    - **RMSNorm**: Pre-normalization for better stability.
+    - **RoPE**: Rotary Positional Embeddings for better long-context performance.
+    - **SwiGLU**: Gated linear unit activation in the MLP.
+    - **GQA**: Grouped-Query Attention for faster inference and lower memory usage.
+- **Optimized for MPS**: Defaults configured for Apple Silicon Metal (MPS) acceleration.
+- **PyTorch Lightning**: Organized training loop with checkpointing, logging, and callbacks.
+- **Zero Dependencies**: Uses standard Hugging Face `transformers` and `datasets` just for tokenization and data loading.
 
 ## Quickstart
 
+### 1. Installation
+
 ```bash
-# 1) Create venv and install
+# Create venv and install
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-# 2) (Optional) Login to HF if you use private tokenizers
+### 2. Training
+
+Train on your laptop with the default tiny config:
+
+```bash
+# Optional: Login to HF if you use private tokenizers/datasets
 # huggingface-cli login
 
-# 3) Edit config.yaml if you want. Defaults are laptop-safe.
-
-# 4) Train (MBP M\u2011series)
+# Train (MBP M‑series friendly defaults)
 python train.py --config config.yaml
+```
 
-# 5) Inference
+### 3. Inference
+
+Generate text from a trained checkpoint:
+
+```bash
 python infer.py --ckpt checkpoints/final.ckpt --tokenizer gpt2 --prompt "The history of Dubai is"
 ```
 
-## Notes
-- **Tokenizer**: default is `gpt2` for zero\u2011friction. Swap to a Llama\u2011family tokenizer later if you have access. Model `vocab_size` adapts automatically.
-- **Dataset**: defaults to `shahrukhx01/wikipedia-bookscorpus-en-preprocessed` (clean + chunked, a good starter). Change `data.dataset` to `wikimedia/wikipedia` (e.g., `20231101.en`) if you want fresher raw articles; youll still pack them here.
-- **Sequence packing**: the dataset is tokenized and **concatenated then chunked** into `(seq_len+1)` blocks for next\u2011token prediction.
-- **GQA**: reduces KV cache size at inference. Configurable via `n_kv_heads`.
-- **SWA (Sliding\u2011Window Attention)**: set `model.swa_window > 0` to restrict attention to last *W* tokens (near\u2011linear cost). Keep it `0` initially.
-- **Precision**: `16-mixed` on MPS works well. If you hit NaNs, try full `32`.
+### 4. Evaluation
 
-## Scaling up (4090)
-- Switch `hardware.accelerator: gpu` and bump `model.n_layers`, `d_model`, `training.seq_len: 2048\u20134096`.
-- Install `flash-attn` and replace SDPA with FlashAttention kernels if you like (left as an exercise, since MPS doesn\u2019t support it).
+Score checkpoints on simple probes:
 
-## Finetuning & Reasoning (later)
-- Add instruction SFT with a chat template and DPO/ORPO for alignment.
-- Add a “reasoning switch”: sample k>1 candidates (self\u2011consistency) and optional verifiers.
+```bash
+python evaluate_checkpoints.py \
+  --checkpoints 'checkpoints/*.ckpt' \
+  --tokenizer gpt2 \
+  --top-k 5 \
+  --cases cases/wiki_basics.yaml
+```
 
----
+## Architecture Details
 
-# End of embedded repo
+This codebase implements a "mini" version of modern LLM architectures (like Llama 2/3, Mistral).
+
+-   **Rotary Positional Embeddings (RoPE)**: Applied to Queries and Keys to encode position without absolute positional embeddings.
+-   **Grouped Query Attention (GQA)**: Keys and Values are shared across groups of Query heads. controlled by `n_heads` and `n_kv_heads` in `config.yaml`.
+-   **SwiGLU MLP**: The feed-forward network uses the Swish-Gated Linear Unit formulation. `d_ff` is typically 4 * `d_model` * (2/3).
+-   **RMSNorm**: Used instead of LayerNorm for normalization.
+
+## Project Structure
+
+```
+├── model.py              # The Transformer architecture (PyTorch nn.Module)
+├── data.py               # Dataset processing (PackedLMDataset, streams)
+├── train.py              # Training script & PyTorch Lightning Module
+├── infer.py              # Simple inference script
+├── config.yaml           # Configuration file
+├── checkpoints/          # Saved model checkpoints
+└── logs/                 # Training logs
+```
+
+## Scaling Up (GPU / 4090)
+
+To move to a dedicated GPU environment:
+
+1.  Update `config.yaml`:
+    -   `hardware.accelerator: gpu`
+    -   Increase `model.n_layers`, `model.d_model`, `training.seq_len`.
+2.  (Optional) Install `flash-attn` for faster attention kernels (MPS does not support FlashAttention yet).
+
+## License
+
+MIT License. See [LICENSE](LICENSE) file.

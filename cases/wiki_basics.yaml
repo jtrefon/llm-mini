@@ -1,0 +1,24 @@
+- name: Capital of France
+  prompt: "The capital of France is"
+  target: " Paris"
+- name: Capital of Japan
+  prompt: "The capital of Japan is"
+  target: " Tokyo"
+- name: Earth satellite
+  prompt: "The Earth revolves around the"
+  target: " Sun"
+- name: Water boiling point
+  prompt: "Water boils at"
+  target: " 100"
+- name: Human body temperature
+  prompt: "Normal human body temperature is"
+  target: " 37"
+- name: Tallest mountain
+  prompt: "The tallest mountain on Earth is"
+  target: " Mount Everest"
+- name: US first president
+  prompt: "The first president of the United States was"
+  target: " George Washington"
+- name: Water formula
+  prompt: "The chemical formula for water is"
+  target: " H2O"
