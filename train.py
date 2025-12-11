@@ -267,6 +267,21 @@ class MetricsLoggingCallback(pl.Callback):
             f.write(text + "\n")
 
 
+class RobustEarlyStopping(EarlyStopping):
+    """EarlyStopping that gracefully skips checks if the metric is missing."""
+    def on_train_epoch_end(self, trainer, pl_module):
+        # Skip if metric is not available yet (common at end of training epoch before validation)
+        if self.monitor not in trainer.callback_metrics:
+            return
+        super().on_train_epoch_end(trainer, pl_module)
+
+    def on_validation_end(self, trainer, pl_module):
+        # Skip if metric is not available
+        if self.monitor not in trainer.callback_metrics:
+            return
+        super().on_validation_end(trainer, pl_module)
+
+
 def setup_logging() -> Path:
     logs_dir = Path('logs')
     logs_dir.mkdir(exist_ok=True)
@@ -318,7 +333,7 @@ def main(config_path='config.yaml'):
 
     es_cfg = cfg['training'].get('early_stopping', {})
     if es_cfg.get('enabled', True):
-        early_stop_cb = EarlyStopping(
+        early_stop_cb = RobustEarlyStopping(
             monitor='val_loss',
             mode='min',
             patience=es_cfg.get('patience', 5),
