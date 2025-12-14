@@ -14,7 +14,6 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from model import GPTMini, GPTConfig
 from data import make_dataloaders, get_tokenizer
 
@@ -36,10 +35,15 @@ class WarmupCosine:
         self.max_steps = max_steps
 
     def __call__(self, step: int) -> float:
-        if step < self.warmup_steps:
-            return step / self.warmup_steps
-        progress = (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
-        return 0.5 * (1 + math.cos(math.pi * progress))
+        # Scheduler `step` is 0-indexed in most PyTorch schedulers; avoid returning 0
+        # so the first scheduled LR is warmup_steps^{-1} * base_lr.
+        s = int(step) + 1
+        if s <= self.warmup_steps:
+            return s / self.warmup_steps
+        denom = max(1, self.max_steps - self.warmup_steps)
+        progress = (s - self.warmup_steps) / denom
+        progress = min(1.0, max(0.0, float(progress)))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 class LitCausalLM(pl.LightningModule):
@@ -116,6 +120,22 @@ class LitCausalLM(pl.LightningModule):
             {'params': nodecay_params, 'weight_decay': 0.0},
         ], lr=lr, betas=betas, eps=eps)
 
+        lr_schedule = str(self.cfg["training"].get("lr_schedule", "warmup_cosine")).lower()
+        if lr_schedule in {"warmup_cosine", "cosine"}:
+            max_steps = int(self.cfg["training"]["max_steps"])
+            warmup_ratio = float(self.cfg["training"].get("warmup_ratio", 0.0))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=WarmupCosine(warmup_ratio, max_steps)
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
+
+        # Fallback: constant LR (or external callbacks can mutate optimizer LR).
         return optimizer
 
 
@@ -320,8 +340,16 @@ def main(config_path='config.yaml'):
     accelerator = cfg['hardware'].get('accelerator', 'auto')
     devices = cfg['hardware'].get('devices', 1)
 
+    # Validation/checkpoint cadence: treat `steps_per_epoch` / `save_every` as optimizer-step units.
+    steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 0) or 0)
+    grad_accum = int(cfg["training"].get("grad_accum_steps", 1) or 1)
+    save_every = int(cfg["training"].get("save_every", 0) or 0)
+    val_check_interval = None
+    if steps_per_epoch > 0:
+        val_check_interval = max(1, steps_per_epoch * grad_accum)
+
     # Callbacks
-    checkpoint_cb = ModelCheckpoint(
+    checkpoint_kwargs = dict(
         dirpath=ckpt_dir,
         filename='epoch={epoch}-step={step}-val_loss={val_loss:.3f}',
         save_top_k=1,
@@ -330,6 +358,9 @@ def main(config_path='config.yaml'):
         save_last=True,
         save_on_train_epoch_end=False,
     )
+    if save_every > 0:
+        checkpoint_kwargs["every_n_train_steps"] = max(1, save_every * grad_accum)
+    checkpoint_cb = ModelCheckpoint(**checkpoint_kwargs)
 
     es_cfg = cfg['training'].get('early_stopping', {})
     if es_cfg.get('enabled', True):
@@ -343,28 +374,29 @@ def main(config_path='config.yaml'):
     else:
         early_stop_cb = None
 
-    rop_cfg = cfg['training'].get('reduce_on_plateau', {})
-    warmup_steps_cb = max(1, int(cfg['training'].get('warmup_ratio', 0.0) * cfg['training']['max_steps']))
-    rop_cb = ReduceLROnPlateauOnVal(
-        patience=rop_cfg.get('patience', 3),
-        factor=rop_cfg.get('factor', 0.5),
-        min_lr=rop_cfg.get('min_lr', 1e-6),
-        monitor='val_loss',
-        mode='min',
-        warmup_steps=warmup_steps_cb,
-    )
+    lr_schedule = str(cfg["training"].get("lr_schedule", "warmup_cosine")).lower()
+    callbacks = [c for c in [checkpoint_cb, early_stop_cb, metrics_logger_cb] if c is not None]
 
-    # Warmup callback
-    max_steps = cfg['training']['max_steps']
-    warmup_cb = WarmupLRCallback(warmup_steps_cb)
-
-    callbacks = [c for c in [checkpoint_cb, early_stop_cb, rop_cb, metrics_logger_cb, warmup_cb] if c is not None]
+    # Optional: plateau scheduler mode (mutates optimizer LR via callback).
+    if lr_schedule in {"plateau", "reduce_on_plateau"}:
+        rop_cfg = cfg['training'].get('reduce_on_plateau', {})
+        warmup_steps_cb = max(1, int(cfg['training'].get('warmup_ratio', 0.0) * cfg['training']['max_steps']))
+        rop_cb = ReduceLROnPlateauOnVal(
+            patience=rop_cfg.get('patience', 3),
+            factor=rop_cfg.get('factor', 0.5),
+            min_lr=rop_cfg.get('min_lr', 1e-6),
+            monitor='val_loss',
+            mode='min',
+            warmup_steps=warmup_steps_cb,
+        )
+        warmup_cb = WarmupLRCallback(warmup_steps_cb)
+        callbacks.extend([rop_cb, warmup_cb])
 
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
-        max_steps=max_steps,
-        precision=cfg['training'].get('precision', 32),
+        max_steps=int(cfg['training']['max_steps']),
+        precision=int(cfg['training'].get('precision', 32)) if str(cfg['training'].get('precision', 32)).isdigit() else cfg['training'].get('precision', 32),
         accumulate_grad_batches=cfg['training'].get('grad_accum_steps', 1),
         log_every_n_steps=cfg['training'].get('log_every_n_steps', 10),
         logger=pl.loggers.CSVLogger("logs"),
@@ -372,6 +404,7 @@ def main(config_path='config.yaml'):
         callbacks=callbacks,
         gradient_clip_val=cfg['training'].get('gradient_clip_val', 1.0),
         limit_val_batches=cfg['training'].get('limit_val_batches', 1.0),
+        val_check_interval=val_check_interval if val_check_interval is not None else 1.0,
     )
 
     print("Starting training loop...")

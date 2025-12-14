@@ -1,5 +1,6 @@
 import torch
 import pytest
+import torch.nn.functional as F
 from model import GPTMini, GPTConfig, build_rope_cache, apply_rope
 
 @pytest.fixture
@@ -81,3 +82,56 @@ def test_kv_cache_logic(tiny_config):
     # A true equivalence test requires instrumenting the forward pass.
     out = model.generate(input_ids[:, :-1], max_new_tokens=1, temperature=0.0)
     assert out.shape == (1, 5)
+
+
+def test_gradient_checkpointing_matches_no_checkpointing():
+    torch.manual_seed(0)
+    vocab_size = 97
+    base_cfg = GPTConfig(
+        vocab_size=vocab_size,
+        n_layers=2,
+        d_model=32,
+        n_heads=4,
+        n_kv_heads=2,
+        d_ff=64,
+        dropout=0.0,
+        rope_theta=100.0,
+        tie_embeddings=True,
+        gradient_checkpointing=False,
+    )
+    ckpt_cfg = GPTConfig(**{**base_cfg.__dict__, "gradient_checkpointing": True})
+
+    model_no = GPTMini(base_cfg)
+    model_ckpt = GPTMini(ckpt_cfg)
+    model_ckpt.load_state_dict(model_no.state_dict())
+
+    model_no.train()
+    model_ckpt.train()
+
+    input_ids = torch.randint(0, vocab_size, (2, 8))
+
+    # Causal next-token loss (shifted).
+    logits_no = model_no(input_ids)
+    loss_no = F.cross_entropy(
+        logits_no[:, :-1, :].reshape(-1, vocab_size),
+        input_ids[:, 1:].reshape(-1),
+    )
+    loss_no.backward()
+
+    logits_ckpt = model_ckpt(input_ids)
+    loss_ckpt = F.cross_entropy(
+        logits_ckpt[:, :-1, :].reshape(-1, vocab_size),
+        input_ids[:, 1:].reshape(-1),
+    )
+    loss_ckpt.backward()
+
+    # Spot-check a few gradients for exact match.
+    pairs = [
+        ("tok_emb.weight", model_no.tok_emb.weight.grad, model_ckpt.tok_emb.weight.grad),
+        ("blocks.0.attn.out.weight", model_no.blocks[0].attn.out.weight.grad, model_ckpt.blocks[0].attn.out.weight.grad),
+        ("blocks.1.mlp.w3.weight", model_no.blocks[1].mlp.w3.weight.grad, model_ckpt.blocks[1].mlp.w3.weight.grad),
+    ]
+    for name, g0, g1 in pairs:
+        assert g0 is not None, f"missing grad for {name} (no-ckpt)"
+        assert g1 is not None, f"missing grad for {name} (ckpt)"
+        assert torch.allclose(g0, g1, atol=0.0, rtol=0.0), f"grad mismatch for {name}"

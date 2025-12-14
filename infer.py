@@ -61,7 +61,7 @@ def load_from_lightning_ckpt(ckpt_path: str, tokenizer_name: str, device: str = 
 def compute_ppl(model, tokenizer, device, text):
     inputs = tokenizer(text, return_tensors='pt').to(device)
     with torch.no_grad():
-        logits = model(inputs['input_ids']).logits
+        logits = model(inputs['input_ids'])
     labels = inputs['input_ids']
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()

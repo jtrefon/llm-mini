@@ -2,8 +2,10 @@ from typing import Iterator, List, Dict, Optional, Iterable, Callable, Union, An
 import itertools
 import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
-from datasets import load_dataset
-from transformers import PreTrainedTokenizer
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from transformers import PreTrainedTokenizer
 
 
 class PackedLMDataset(Dataset):
@@ -79,8 +81,9 @@ class StreamingPackedLMDataset(IterableDataset):
     def __init__(
         self,
         texts_factory: Callable[[], Iterable[str]],
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Any,
         seq_len: int,
+        max_doc_len: Optional[int] = None,
         max_docs: Optional[int] = None,
         add_eos: bool = True,
     ):
@@ -92,6 +95,7 @@ class StreamingPackedLMDataset(IterableDataset):
         self.texts_factory = texts_factory
         self.tokenizer = tokenizer
         self.seq_len = int(seq_len)
+        self.max_doc_len = int(max_doc_len) if max_doc_len is not None else int(seq_len)
         self.max_docs = int(max_docs) if max_docs is not None else None
         self.add_eos = bool(add_eos)
 
@@ -122,7 +126,10 @@ class StreamingPackedLMDataset(IterableDataset):
                 continue
 
             enc = self.tokenizer(
-                text, add_special_tokens=True, truncation=True, max_length=self.seq_len
+                text,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=self.max_doc_len,
             )
             ids = enc["input_ids"]
             if (
@@ -155,6 +162,8 @@ def load_text_dataset(
     verbose: bool = True,
 ) -> Iterator[str]:
     """Load a HF dataset and yield raw text strings."""
+    from datasets import load_dataset
+
     ds = load_dataset(name, config_name, split=split, streaming=streaming)
     if verbose:
         print(
@@ -186,22 +195,24 @@ def load_text_dataset(
 
 
 def build_token_sequences(
-    tokenizer: PreTrainedTokenizer,
+    tokenizer: Any,
     texts: Iterator[str],
     max_docs: int = 20000,
     seq_len: int = 1024,
+    max_doc_len: Optional[int] = None,
 ) -> List[List[int]]:
     """Tokenize texts into lists of token ids, ensuring EOS between documents."""
     tokens: List[List[int]] = []
     eos_id = getattr(tokenizer, "eos_token_id", None)
     total_tokens = 0
+    max_doc_len = int(max_doc_len) if max_doc_len is not None else int(seq_len)
     for i, t in enumerate(texts):
         if i % 1000 == 0:
             print(
                 f"Tokenizing document {i+1}/{max_docs if max_docs else 'inf'}", end="\r"
             )
         enc = tokenizer(
-            t, add_special_tokens=True, truncation=True, max_length=seq_len
+            t, add_special_tokens=True, truncation=True, max_length=max_doc_len
         )
         ids = enc["input_ids"]
         total_tokens += len(ids)
@@ -223,11 +234,12 @@ def collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
 
 
 def make_dataloaders(
-    cfg: Dict[str, Any], tokenizer: PreTrainedTokenizer
+    cfg: Dict[str, Any], tokenizer: Any
 ) -> Tuple[DataLoader, DataLoader]:
     """Prepares training and validation DataLoaders based on configuration."""
     seq_len = cfg["training"]["seq_len"]
     print("Starting data preparation with seq_len=", seq_len)
+    max_doc_len = int(cfg["data"].get("max_doc_len") or min(int(seq_len) * 4, 8192))
 
     streaming = bool(cfg["data"]["streaming"])
     accelerator = cfg["hardware"].get("accelerator", "auto")
@@ -273,6 +285,7 @@ def make_dataloaders(
             make_stream_factory(train_split),
             tokenizer,
             seq_len,
+            max_doc_len=max_doc_len,
             max_docs=train_docs,
         )
         dl_kwargs = dict(
@@ -296,6 +309,7 @@ def make_dataloaders(
             make_stream_factory(val_split, skip_docs=skip_for_val),
             tokenizer,
             seq_len,
+            max_doc_len=max_doc_len,
             max_docs=val_docs,
         )
         dl_kwargs = dict(
@@ -326,7 +340,11 @@ def make_dataloaders(
     train_docs = cfg["data"].get("train_docs") or 900000
     print(f"Tokenizing {train_docs} training documents (non-streaming)...")
     train_token_seqs = build_token_sequences(
-        tokenizer, train_texts, max_docs=train_docs, seq_len=seq_len
+        tokenizer,
+        train_texts,
+        max_docs=train_docs,
+        seq_len=seq_len,
+        max_doc_len=max_doc_len,
     )
     train_ds = PackedLMDataset(train_token_seqs, seq_len=seq_len)
     print(f"Created training dataset with {len(train_ds)} sequences")
@@ -360,7 +378,11 @@ def make_dataloaders(
         val_texts = itertools.islice(val_texts, train_docs, None)
     print(f"Tokenizing {val_docs} validation documents (non-streaming)...")
     val_token_seqs = build_token_sequences(
-        tokenizer, val_texts, max_docs=val_docs, seq_len=seq_len
+        tokenizer,
+        val_texts,
+        max_docs=val_docs,
+        seq_len=seq_len,
+        max_doc_len=max_doc_len,
     )
     val_ds = PackedLMDataset(val_token_seqs, seq_len=seq_len)
     print(f"Created validation dataset with {len(val_ds)} sequences")
@@ -389,6 +411,8 @@ def get_tokenizer(cfg: Dict[str, Any]):
     tok = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token if tok.eos_token is not None else tok.unk_token
-    tok.model_max_length = 1024
+    try:
+        tok.model_max_length = int(cfg["training"]["seq_len"])
+    except Exception:
+        tok.model_max_length = 1024
     return tok
-

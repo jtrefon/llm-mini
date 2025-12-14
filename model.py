@@ -144,8 +144,7 @@ class GQAMultiheadAttention(nn.Module):
         self.Wk = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.Wv = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.out = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
-        # Disable attention dropout by default; keep dropout in MLP/residual path
-        self.dropout = nn.Dropout(0.0)
+        self.dropout = nn.Dropout(float(dropout))
 
     def forward(
         self,
@@ -351,6 +350,25 @@ class GPTMini(nn.Module):
         self.register_buffer("_rope_sin", None, persistent=False)
         self.register_buffer("_rope_cos", None, persistent=False)
         self._rope_cache_params = (0, 0, 0.0)  # (seq_len, head_dim, theta)
+        self._init_weights()
+
+    def _init_weights(self):
+        # GPT-style init; residual projections get smaller std for stability.
+        base_std = 0.02
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=base_std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=base_std)
+
+        # Scale residual projections (GPT-2 style) to stabilize deep stacks.
+        if self.config.n_layers > 0:
+            resid_std = base_std / math.sqrt(2.0 * float(self.config.n_layers))
+            for block in self.blocks:
+                nn.init.normal_(block.attn.out.weight, mean=0.0, std=resid_std)
+                nn.init.normal_(block.mlp.w3.weight, mean=0.0, std=resid_std)
 
     def _maybe_build_rope(
         self, seq_len: int, head_dim: int, theta: float, device: torch.device, dtype: torch.dtype
@@ -402,10 +420,10 @@ class GPTMini(nn.Module):
         )
         for i, blk in enumerate(self.blocks):
             if use_ckpt:
-
-                # Wrap block forward with checkpoint to save activation memory
-                def fn(x):
-                    return blk(
+                # IMPORTANT: bind `blk` per-iteration; otherwise checkpoint recompute can
+                # close over the loop variable and use the wrong block.
+                def fn(x, block=blk):
+                    return block(
                         x,
                         self._rope_sin,
                         self._rope_cos,
@@ -594,4 +612,3 @@ class GPTMini(nn.Module):
             gen_ids = torch.cat(generated, dim=1)
             return torch.cat([input_ids[:, :total_len], gen_ids], dim=1)
         return input_ids
-

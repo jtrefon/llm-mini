@@ -18,6 +18,7 @@ training:
   max_steps: 20000        # Maximum number of training steps
   #eval_every: 4000         # not used when steps_per_epoch is set; kept for reference
   save_every: 100         # Save every X steps
+  lr_schedule: "warmup_cosine"  # "warmup_cosine" (recommended) or "plateau"
   lr: 3.0e-4              # tuned lower for stability with ~64 sequence effective batch
   weight_decay: 0.1       # it's a regularization term that prevents overfitting, 0.1 is default
   betas: [0.9, 0.95]      # it's a hyperparameter which scale and shift normalized input
@@ -59,6 +60,7 @@ data:
   tokenizer_name: "gpt2"  # change to a Llama tokenizer later if you have access
   max_shards: 100        # optional: limit shards/rows for quick smoke tests
   pack_sequences: true    # concatenate tokens and pack into fixed-length blocks
+  max_doc_len: 4096       # per-document tokenization cap (larger captures more long-form structure)
 
   # Dataset size configuration
   train_docs: 70000     # Number of training documents
