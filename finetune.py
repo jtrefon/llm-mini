@@ -25,7 +25,7 @@ class LitSFT(LitCausalLM):
         labels = batch['labels']
         logits = self(input_ids)
         loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), labels.view(-1)
+            logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
         )
         self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
         ppl = torch.exp(loss)

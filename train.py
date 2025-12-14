@@ -79,7 +79,7 @@ class LitCausalLM(pl.LightningModule):
         labels = batch['labels']
         logits = self(input_ids)
         loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), labels.view(-1)
+            logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
         )
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
@@ -89,7 +89,7 @@ class LitCausalLM(pl.LightningModule):
         labels = batch['labels']
         logits = self(input_ids)
         loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), labels.view(-1)
+            logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
         )
         if torch.isnan(loss) or torch.isinf(loss):
             loss = torch.tensor(10.0, device=loss.device)
