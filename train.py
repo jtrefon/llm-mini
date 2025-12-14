@@ -289,6 +289,7 @@ class MetricsLoggingCallback(pl.Callback):
 
 class RobustEarlyStopping(EarlyStopping):
     """EarlyStopping that gracefully skips checks if the metric is missing."""
+ 
     def on_train_epoch_end(self, trainer, pl_module):
         # Skip if metric is not available yet (common at end of training epoch before validation)
         if self.monitor not in trainer.callback_metrics:
@@ -298,6 +299,22 @@ class RobustEarlyStopping(EarlyStopping):
     def on_validation_end(self, trainer, pl_module):
         # Skip if metric is not available
         if self.monitor not in trainer.callback_metrics:
+            return
+        super().on_validation_end(trainer, pl_module)
+
+
+class EarlyStoppingRespectConfig(RobustEarlyStopping):
+    def __init__(self, *args, warmup_steps: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._warmup_steps = int(max(0, warmup_steps))
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.global_step < self._warmup_steps:
+            return
+        super().on_train_epoch_end(trainer, pl_module)
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.global_step < self._warmup_steps:
             return
         super().on_validation_end(trainer, pl_module)
 
@@ -330,7 +347,8 @@ def main(config_path='config.yaml'):
 
     # Resume logic: auto-resume from latest if exists
     ckpt_dir = cfg['training'].get('checkpoint_dir', 'checkpoints')
-    resume_checkpoint = find_latest_checkpoint(ckpt_dir)
+    auto_resume = bool(cfg['training'].get('auto_resume', True))
+    resume_checkpoint = find_latest_checkpoint(ckpt_dir) if auto_resume else None
     if resume_checkpoint:
         print(f"Resuming from latest checkpoint: {resume_checkpoint}")
     else:
@@ -364,12 +382,16 @@ def main(config_path='config.yaml'):
 
     es_cfg = cfg['training'].get('early_stopping', {})
     if es_cfg.get('enabled', True):
-        early_stop_cb = RobustEarlyStopping(
+        max_steps = int(cfg['training']['max_steps'])
+        warmup_fraction = float(es_cfg.get('warmup_fraction', 0.0) or 0.0)
+        warmup_steps_es = int(max(0, warmup_fraction) * max_steps)
+        early_stop_cb = EarlyStoppingRespectConfig(
             monitor='val_loss',
             mode='min',
             patience=es_cfg.get('patience', 5),
             min_delta=es_cfg.get('min_delta', 0.001),
             verbose=True,
+            warmup_steps=warmup_steps_es,
         )
     else:
         early_stop_cb = None
@@ -398,6 +420,9 @@ def main(config_path='config.yaml'):
         max_steps=int(cfg['training']['max_steps']),
         precision=int(cfg['training'].get('precision', 32)) if str(cfg['training'].get('precision', 32)).isdigit() else cfg['training'].get('precision', 32),
         accumulate_grad_batches=cfg['training'].get('grad_accum_steps', 1),
+        fast_dev_run=bool(cfg['training'].get('fast_dev_run', False)),
+        overfit_batches=cfg['training'].get('overfit_batches', 0.0),
+        limit_train_batches=cfg['training'].get('limit_train_batches', 1.0),
         log_every_n_steps=cfg['training'].get('log_every_n_steps', 10),
         logger=pl.loggers.CSVLogger("logs"),
         enable_checkpointing=True,
