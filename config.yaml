@@ -60,9 +60,9 @@ data:
   tokenizer_name: "gpt2"  # change to a Llama tokenizer later if you have access
   max_shards: 100        # optional: limit shards/rows for quick smoke tests
   pack_sequences: true    # concatenate tokens and pack into fixed-length blocks
-  max_doc_len: 4096       # per-document tokenization cap (larger captures more long-form structure)
+  max_doc_len: 0         # per-document tokenization cap (larger captures more long-form structure)
 
   # Dataset size configuration
-  train_docs: 70000     # Number of training documents
-  val_docs: 1000        # Number of validation documents (separate batch)
+  train_docs: 0          # 0 or null = unlimited documents
+  val_docs: 1000         # Keep validation bounded to avoid extremely long validation runs
   config: "20231101.en"  # Dataset config for English Wikipedia

@@ -8,6 +8,26 @@ if TYPE_CHECKING:  # pragma: no cover
     from transformers import PreTrainedTokenizer
 
 
+def _coerce_optional_positive_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Expected int-like value, got {value!r}") from exc
+    if ivalue <= 0:
+        return None
+    return ivalue
+
+
+def _get_optional_positive_int(
+    cfg: Dict[str, Any], key: str, default: Optional[int]
+) -> Optional[int]:
+    if key not in cfg:
+        return default
+    return _coerce_optional_positive_int(cfg.get(key))
+
+
 class PackedLMDataset(Dataset):
     """Dataset that concatenates tokenized text and packs into fixed-length sequences.
 
@@ -95,8 +115,8 @@ class StreamingPackedLMDataset(IterableDataset):
         self.texts_factory = texts_factory
         self.tokenizer = tokenizer
         self.seq_len = int(seq_len)
-        self.max_doc_len = int(max_doc_len) if max_doc_len is not None else int(seq_len)
-        self.max_docs = int(max_docs) if max_docs is not None else None
+        self.max_doc_len = _coerce_optional_positive_int(max_doc_len)
+        self.max_docs = _coerce_optional_positive_int(max_docs)
         self.add_eos = bool(add_eos)
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
@@ -125,12 +145,20 @@ class StreamingPackedLMDataset(IterableDataset):
             if not isinstance(text, str) or len(text) == 0:
                 continue
 
-            enc = self.tokenizer(
-                text,
-                add_special_tokens=True,
-                truncation=True,
-                max_length=self.max_doc_len,
-            )
+            if self.max_doc_len is None:
+                enc = self.tokenizer(
+                    text,
+                    add_special_tokens=True,
+                    truncation=False,
+                    max_length=None,
+                )
+            else:
+                enc = self.tokenizer(
+                    text,
+                    add_special_tokens=True,
+                    truncation=True,
+                    max_length=self.max_doc_len,
+                )
             ids = enc["input_ids"]
             if (
                 self.add_eos
@@ -138,6 +166,12 @@ class StreamingPackedLMDataset(IterableDataset):
                 and (len(ids) == 0 or ids[-1] != eos_id)
             ):
                 ids = ids + [eos_id]
+            # Prevent runaway memory from extremely long docs: keep buffer bounded to a few sequences
+            # Also cap per-document token count to avoid memory blowup when max_doc_len is None
+            max_effective_len = self.seq_len * 4
+            if len(ids) > max_effective_len:
+                # Keep the tail; most documents have key info at the end
+                ids = ids[-max_effective_len:]
             buffer.extend(ids)
             docs_seen += 1
 
@@ -150,6 +184,12 @@ class StreamingPackedLMDataset(IterableDataset):
                 x = torch.tensor(chunk[:-1], dtype=torch.long)
                 y = torch.tensor(chunk[1:], dtype=torch.long)
                 yield {"input_ids": x, "labels": y}
+
+            # Trim buffer to avoid bloat across huge docs
+            max_buffer = target * 4
+            if len(buffer) > max_buffer:
+                excess = len(buffer) % target
+                buffer = buffer[-(max_buffer - excess):]
 
 
 def load_text_dataset(
@@ -197,7 +237,7 @@ def load_text_dataset(
 def build_token_sequences(
     tokenizer: Any,
     texts: Iterator[str],
-    max_docs: int = 20000,
+    max_docs: Optional[int] = 20000,
     seq_len: int = 1024,
     max_doc_len: Optional[int] = None,
 ) -> List[List[int]]:
@@ -205,20 +245,31 @@ def build_token_sequences(
     tokens: List[List[int]] = []
     eos_id = getattr(tokenizer, "eos_token_id", None)
     total_tokens = 0
-    max_doc_len = int(max_doc_len) if max_doc_len is not None else int(seq_len)
+    max_doc_len = _coerce_optional_positive_int(max_doc_len)
+    max_docs = _coerce_optional_positive_int(max_docs)
     for i, t in enumerate(texts):
         if i % 1000 == 0:
             print(
                 f"Tokenizing document {i+1}/{max_docs if max_docs else 'inf'}", end="\r"
             )
-        enc = tokenizer(
-            t, add_special_tokens=True, truncation=True, max_length=max_doc_len
-        )
+
+        if max_doc_len is None:
+            enc = tokenizer(t, add_special_tokens=True, truncation=False, max_length=None)
+        else:
+            enc = tokenizer(
+                t, add_special_tokens=True, truncation=True, max_length=max_doc_len
+            )
         ids = enc["input_ids"]
         total_tokens += len(ids)
         # Ensure documents are terminated with EOS to prevent cross-doc leakage
         if eos_id is not None and (len(ids) == 0 or ids[-1] != eos_id):
             ids = ids + [eos_id]
+        # Cap per-document token count at a reasonable multiple of seq_len to avoid memory blowup
+        # even when max_doc_len is None. This keeps streaming practical.
+        max_effective_len = seq_len * 4
+        if len(ids) > max_effective_len:
+            # Keep the tail; most documents have key info at the end
+            ids = ids[-max_effective_len:]
         tokens.append(ids)
         if max_docs is not None and (i + 1) >= max_docs:
             break
@@ -237,16 +288,19 @@ def make_dataloaders(
     cfg: Dict[str, Any], tokenizer: Any
 ) -> Tuple[DataLoader, DataLoader]:
     """Prepares training and validation DataLoaders based on configuration."""
+    data_cfg = cfg["data"]
     seq_len = cfg["training"]["seq_len"]
     print("Starting data preparation with seq_len=", seq_len)
-    max_doc_len = int(cfg["data"].get("max_doc_len") or min(int(seq_len) * 4, 8192))
+    max_doc_len = _get_optional_positive_int(
+        data_cfg, "max_doc_len", min(int(seq_len) * 4, 8192)
+    )
 
-    streaming = bool(cfg["data"]["streaming"])
+    streaming = bool(data_cfg["streaming"])
     accelerator = cfg["hardware"].get("accelerator", "auto")
     num_workers_cfg = int(cfg["hardware"].get("num_workers", 0) or 0)
-    train_split = cfg["data"]["split"]
-    val_split = cfg["data"].get("val_split", train_split)
-    max_shards = cfg["data"]["max_shards"]
+    train_split = data_cfg["split"]
+    val_split = data_cfg.get("val_split", train_split)
+    max_shards = data_cfg["max_shards"]
 
     # Heuristic: on MPS, keep num_workers=0 and pin_memory=False to reduce host memory footprint
     if accelerator == "mps":
@@ -280,7 +334,7 @@ def make_dataloaders(
 
             return factory
 
-        train_docs = int(cfg["data"].get("train_docs") or 900000)
+        train_docs = _get_optional_positive_int(data_cfg, "train_docs", 900000)
         train_ds = StreamingPackedLMDataset(
             make_stream_factory(train_split),
             tokenizer,
@@ -303,8 +357,8 @@ def make_dataloaders(
 
         # Validation stream: separate loader; for simplicity use a separate dataset read
         print("Preparing validation streaming dataset...")
-        skip_for_val = train_docs if val_split == train_split else 0
-        val_docs = int(cfg["data"].get("val_docs") or 100000)
+        skip_for_val = train_docs if (val_split == train_split and train_docs is not None) else 0
+        val_docs = _get_optional_positive_int(data_cfg, "val_docs", 100000)
         val_ds = StreamingPackedLMDataset(
             make_stream_factory(val_split, skip_docs=skip_for_val),
             tokenizer,
@@ -337,7 +391,7 @@ def make_dataloaders(
         max_shards=max_shards,
         verbose=True,
     )
-    train_docs = cfg["data"].get("train_docs") or 900000
+    train_docs = _get_optional_positive_int(data_cfg, "train_docs", 900000)
     print(f"Tokenizing {train_docs} training documents (non-streaming)...")
     train_token_seqs = build_token_sequences(
         tokenizer,
@@ -373,8 +427,8 @@ def make_dataloaders(
         max_shards=max_shards,
         verbose=True,
     )
-    val_docs = cfg["data"].get("val_docs") or 100000
-    if val_split == train_split:
+    val_docs = _get_optional_positive_int(data_cfg, "val_docs", 100000)
+    if val_split == train_split and train_docs is not None:
         val_texts = itertools.islice(val_texts, train_docs, None)
     print(f"Tokenizing {val_docs} validation documents (non-streaming)...")
     val_token_seqs = build_token_sequences(
