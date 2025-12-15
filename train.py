@@ -258,28 +258,71 @@ class MetricsLoggingCallback(pl.Callback):
     def __init__(self, log_file: Path):
         super().__init__()
         self.log_file = log_file
+        self._header_written = False
 
-    def on_validation_epoch_end(self, trainer, pl_module):
+    def on_fit_start(self, trainer, pl_module):
+        if trainer.is_global_zero and not self._header_written:
+            self._append_line("timestamp | step | epoch | kind | train_loss | val_loss | val_ppl | lr")
+            self._header_written = True
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not trainer.is_global_zero:
+            return
+        every = int(getattr(pl_module, "cfg", {}).get("training", {}).get("metrics_log_every_n_steps", 50) or 50)
+        if every <= 0:
+            return
+        step = int(trainer.global_step)
+        if step == 0 or (step % every) != 0:
+            return
+
         metrics = trainer.callback_metrics
-        train_loss = metrics.get('train_loss_epoch')
-        val_loss = metrics.get('val_loss')
-        val_ppl  = metrics.get('val_ppl')
+        train_loss = metrics.get("train_loss")
         lr = None
         if trainer.optimizers:
             try:
-                lr = trainer.optimizers[0].param_groups[0].get('lr', None)
+                lr = trainer.optimizers[0].param_groups[0].get("lr", None)
             except Exception:
-                pass
-        epoch = trainer.current_epoch
+                lr = None
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        epoch = int(trainer.current_epoch)
         line = (
-            f"{ts} | epoch={epoch}"
-            f" | train_loss={float(train_loss):.4f}" if train_loss is not None else f"{ts} | epoch={epoch} | train_loss=-"
+            f"{ts} | step={step} | epoch={epoch} | kind=train"
+            f" | train_loss={float(train_loss):.4f}" if train_loss is not None else f"{ts} | step={step} | epoch={epoch} | kind=train | train_loss=-"
         )
+        line += " | val_loss=- | val_ppl=-"
+        line += f" | lr={float(lr):.6g}" if isinstance(lr, (int, float)) else " | lr=-"
+        self._append_line(line)
+        try:
+            print(line)
+        except Exception:
+            pass
+
+    def on_validation_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
+            return
+        metrics = trainer.callback_metrics
+        train_loss_epoch = metrics.get("train_loss_epoch")
+        val_loss = metrics.get("val_loss")
+        val_ppl = metrics.get("val_ppl")
+        lr = None
+        if trainer.optimizers:
+            try:
+                lr = trainer.optimizers[0].param_groups[0].get("lr", None)
+            except Exception:
+                lr = None
+        step = int(trainer.global_step)
+        epoch = int(trainer.current_epoch)
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f"{ts} | step={step} | epoch={epoch} | kind=val"
+        line += f" | train_loss={float(train_loss_epoch):.4f}" if train_loss_epoch is not None else " | train_loss=-"
         line += f" | val_loss={float(val_loss):.4f}" if val_loss is not None else " | val_loss=-"
         line += f" | val_ppl={float(val_ppl):.4f}" if val_ppl is not None else " | val_ppl=-"
-        line += f" | lr={lr:.6f}" if isinstance(lr, (int, float)) else " | lr=-"
+        line += f" | lr={float(lr):.6g}" if isinstance(lr, (int, float)) else " | lr=-"
         self._append_line(line)
+        try:
+            print(line)
+        except Exception:
+            pass
 
     def _append_line(self, text: str):
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +377,15 @@ def main(config_path='config.yaml'):
     # Suppress specific PyTorch Lightning warnings
     warnings.filterwarnings("ignore", message="You're resuming from a checkpoint that ended before the epoch ended")
     pl.seed_everything(cfg['training']['seed'])
+
+    os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    try:
+        from datasets.utils.logging import disable_progress_bar
+
+        disable_progress_bar()
+    except Exception:
+        pass
 
     tokenizer = get_tokenizer(cfg)
     train_loader, val_loader = make_dataloaders(cfg, tokenizer)
@@ -425,6 +477,8 @@ def main(config_path='config.yaml'):
         limit_train_batches=cfg['training'].get('limit_train_batches', 1.0),
         log_every_n_steps=cfg['training'].get('log_every_n_steps', 10),
         logger=pl.loggers.CSVLogger("logs"),
+        enable_model_summary=bool(cfg['training'].get('enable_model_summary', False)),
+        enable_progress_bar=bool(cfg['training'].get('enable_progress_bar', False)),
         enable_checkpointing=True,
         callbacks=callbacks,
         gradient_clip_val=cfg['training'].get('gradient_clip_val', 1.0),

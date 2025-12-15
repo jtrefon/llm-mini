@@ -200,22 +200,22 @@ def load_text_dataset(
 ) -> Iterator[str]:
     """Load a HF dataset and yield raw text strings."""
     from datasets import load_dataset
+    from datasets import DownloadConfig
     import os
 
-    # Force offline mode to avoid HF API calls during training
-    if offline_mode or os.getenv("HF_OFFLINE_MODE", "0").lower() in ("1", "true", "yes"):
-        os.environ["HF_DATASETS_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    
-    load_kwargs = {
-        "path": name,
-        "name": config_name,
-        "split": split,
-        "streaming": streaming,
-        "download_mode": "force_redownload" if not offline_mode else "reuse_cache_if_exists",
-    }
-    
-    ds = load_dataset(**load_kwargs)
+    offline_env = os.getenv("HF_OFFLINE_MODE", "0").lower() in ("1", "true", "yes")
+    offline = bool(offline_mode or offline_env)
+
+    # When offline, avoid *any* network calls. If the dataset isn't cached, this will error early.
+    download_config = DownloadConfig(local_files_only=True) if offline else None
+    ds = load_dataset(
+        name,
+        config_name,
+        split=split,
+        streaming=streaming,
+        download_config=download_config,
+        download_mode="reuse_cache_if_exists",
+    )
     if verbose:
         print(
             f"Loading dataset: {name}/{config_name}, split: {split}, streaming: {streaming}"
@@ -329,27 +329,66 @@ def make_dataloaders(
     if streaming:
         print("Using streaming IterableDataset to avoid loading full corpus into memory")
 
-        def make_stream_factory(split_name: str, skip_docs: int = 0):
+        # IMPORTANT: load the HF dataset once in the main process.
+        # If `load_dataset` runs inside DataLoader workers, each worker can hit the Hub,
+        # leading to rate limits/timeouts.
+        from datasets import load_dataset, DownloadConfig
+        import os
+
+        offline_env = os.getenv("HF_OFFLINE_MODE", "0").lower() in ("1", "true", "yes")
+        offline_cfg = bool(data_cfg.get("offline", False) or offline_env)
+        download_config = DownloadConfig(local_files_only=True) if offline_cfg else None
+
+        ds_train = load_dataset(
+            cfg["data"]["dataset"],
+            cfg["data"].get("config", None),
+            split=train_split,
+            streaming=True,
+            download_config=download_config,
+            download_mode="reuse_cache_if_exists",
+        )
+        ds_val = load_dataset(
+            cfg["data"]["dataset"],
+            cfg["data"].get("config", None),
+            split=val_split,
+            streaming=True,
+            download_config=download_config,
+            download_mode="reuse_cache_if_exists",
+        )
+
+        # Shuffle streams (bounded buffer) in the main process so workers only iterate.
+        try:
+            ds_train = ds_train.shuffle(buffer_size=512, seed=42)
+        except TypeError:
+            ds_train = ds_train.shuffle(512, seed=42)
+        try:
+            ds_val = ds_val.shuffle(buffer_size=512, seed=42)
+        except TypeError:
+            ds_val = ds_val.shuffle(512, seed=42)
+
+        text_field = cfg["data"]["text_field"]
+
+        def _texts_from_stream(ds: Any, skip_docs: int = 0) -> Iterator[str]:
+            it: Iterable[Any] = ds
+            if skip_docs > 0:
+                it = itertools.islice(it, skip_docs, None)
+            for ex in it:
+                try:
+                    text = ex[text_field]
+                except Exception:
+                    continue
+                if isinstance(text, str) and len(text) > 0:
+                    yield text
+
+        def make_stream_factory(ds: Any, skip_docs: int = 0):
             def factory():
-                iterator = load_text_dataset(
-                    name=cfg["data"]["dataset"],
-                    config_name=cfg["data"].get("config", None),
-                    split=split_name,
-                    text_field=cfg["data"]["text_field"],
-                    streaming=True,
-                    max_shards=max_shards,
-                    verbose=False,
-                    offline_mode=True,  # Force offline to avoid API calls in workers
-                )
-                if skip_docs > 0:
-                    iterator = itertools.islice(iterator, skip_docs, None)
-                return iterator
+                return _texts_from_stream(ds, skip_docs=skip_docs)
 
             return factory
 
         train_docs = _get_optional_positive_int(data_cfg, "train_docs", 900000)
         train_ds = StreamingPackedLMDataset(
-            make_stream_factory(train_split),
+            make_stream_factory(ds_train),
             tokenizer,
             seq_len,
             max_doc_len=max_doc_len,
@@ -373,7 +412,7 @@ def make_dataloaders(
         skip_for_val = train_docs if (val_split == train_split and train_docs is not None) else 0
         val_docs = _get_optional_positive_int(data_cfg, "val_docs", 100000)
         val_ds = StreamingPackedLMDataset(
-            make_stream_factory(val_split, skip_docs=skip_for_val),
+            make_stream_factory(ds_val, skip_docs=skip_for_val),
             tokenizer,
             seq_len,
             max_doc_len=max_doc_len,
