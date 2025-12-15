@@ -46,9 +46,9 @@ training:
     warmup_fraction: 0.3  # Ignore early-stopping decisions in initial 30% of steps
 
 hardware:
-  accelerator: "mps"      # "mps" on Apple Silicon; use "gpu" on 4090; "auto" also works
+  accelerator: "cuda"      # "mps" on Apple Silicon; use "cuda" on 4090; "auto" also works
   devices: 1
-  num_workers: 0         # on MPS prefer 0 to reduce host memory; increase on CUDA if memory allows
+  num_workers: 8         # Increased for RTX 4090; will be auto-limited to max_shards
 
 # Dataset options. Start with a preprocessed, manageable corpus.
 data:

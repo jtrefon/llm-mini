@@ -196,11 +196,26 @@ def load_text_dataset(
     streaming: bool = False,
     max_shards: Optional[int] = None,
     verbose: bool = True,
+    offline_mode: bool = False,
 ) -> Iterator[str]:
     """Load a HF dataset and yield raw text strings."""
     from datasets import load_dataset
+    import os
 
-    ds = load_dataset(name, config_name, split=split, streaming=streaming)
+    # Force offline mode to avoid HF API calls during training
+    if offline_mode or os.getenv("HF_OFFLINE_MODE", "0").lower() in ("1", "true", "yes"):
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    
+    load_kwargs = {
+        "path": name,
+        "name": config_name,
+        "split": split,
+        "streaming": streaming,
+        "download_mode": "force_redownload" if not offline_mode else "reuse_cache_if_exists",
+    }
+    
+    ds = load_dataset(**load_kwargs)
     if verbose:
         print(
             f"Loading dataset: {name}/{config_name}, split: {split}, streaming: {streaming}"
@@ -301,7 +316,12 @@ def make_dataloaders(
         persistent = False
         prefetch = None
     else:
-        num_workers = num_workers_cfg
+        # Limit num_workers to avoid num_shards mismatch warnings
+        # When using streaming with max_shards, each shard is processed by one worker
+        if streaming and max_shards and max_shards > 0:
+            num_workers = min(num_workers_cfg, max_shards)
+        else:
+            num_workers = num_workers_cfg
         pin_memory = True
         persistent = bool(num_workers > 0)
         prefetch = 1 if persistent else None
@@ -319,6 +339,7 @@ def make_dataloaders(
                     streaming=True,
                     max_shards=max_shards,
                     verbose=False,
+                    offline_mode=True,  # Force offline to avoid API calls in workers
                 )
                 if skip_docs > 0:
                     iterator = itertools.islice(iterator, skip_docs, None)
@@ -382,6 +403,7 @@ def make_dataloaders(
         streaming=False,
         max_shards=max_shards,
         verbose=True,
+        offline_mode=True,  # Force offline to avoid API calls
     )
     train_docs = _get_optional_positive_int(data_cfg, "train_docs", 900000)
     print(f"Tokenizing {train_docs} training documents (non-streaming)...")
@@ -418,6 +440,7 @@ def make_dataloaders(
         streaming=False,
         max_shards=max_shards,
         verbose=True,
+        offline_mode=True,  # Force offline to avoid API calls
     )
     val_docs = _get_optional_positive_int(data_cfg, "val_docs", 100000)
     if val_split == train_split and train_docs is not None:
