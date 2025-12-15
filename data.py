@@ -130,6 +130,7 @@ class StreamingPackedLMDataset(IterableDataset):
 
         eos_id = getattr(self.tokenizer, "eos_token_id", None)
         buffer: List[int] = []
+        buf_pos = 0
         docs_seen = 0
 
         texts_iter = self.texts_factory()
@@ -167,29 +168,24 @@ class StreamingPackedLMDataset(IterableDataset):
             ):
                 ids = ids + [eos_id]
             # Prevent runaway memory from extremely long docs: keep buffer bounded to a few sequences
-            # Also cap per-document token count to avoid memory blowup when max_doc_len is None
-            max_effective_len = self.seq_len * 4
-            if len(ids) > max_effective_len:
-                # Keep the tail; most documents have key info at the end
-                ids = ids[-max_effective_len:]
+            # without truncating documents.
             buffer.extend(ids)
             docs_seen += 1
 
             # Yield as many full sequences as possible
             # We pack into (seq_len+1) to create shifted labels
             target = self.seq_len + 1
-            while len(buffer) >= target:
-                chunk = buffer[:target]
-                buffer = buffer[target:]
+            while (len(buffer) - buf_pos) >= target:
+                chunk = buffer[buf_pos : buf_pos + target]
+                buf_pos += target
                 x = torch.tensor(chunk[:-1], dtype=torch.long)
                 y = torch.tensor(chunk[1:], dtype=torch.long)
                 yield {"input_ids": x, "labels": y}
 
             # Trim buffer to avoid bloat across huge docs
-            max_buffer = target * 4
-            if len(buffer) > max_buffer:
-                excess = len(buffer) % target
-                buffer = buffer[-(max_buffer - excess):]
+            if buf_pos > target * 64:
+                buffer = buffer[buf_pos:]
+                buf_pos = 0
 
 
 def load_text_dataset(
@@ -264,12 +260,8 @@ def build_token_sequences(
         # Ensure documents are terminated with EOS to prevent cross-doc leakage
         if eos_id is not None and (len(ids) == 0 or ids[-1] != eos_id):
             ids = ids + [eos_id]
-        # Cap per-document token count at a reasonable multiple of seq_len to avoid memory blowup
-        # even when max_doc_len is None. This keeps streaming practical.
-        max_effective_len = seq_len * 4
-        if len(ids) > max_effective_len:
-            # Keep the tail; most documents have key info at the end
-            ids = ids[-max_effective_len:]
+        # No per-document truncation is applied when max_doc_len is None.
+        # Documents are packed into fixed-length training sequences downstream.
         tokens.append(ids)
         if max_docs is not None and (i + 1) >= max_docs:
             break
@@ -292,7 +284,7 @@ def make_dataloaders(
     seq_len = cfg["training"]["seq_len"]
     print("Starting data preparation with seq_len=", seq_len)
     max_doc_len = _get_optional_positive_int(
-        data_cfg, "max_doc_len", min(int(seq_len) * 4, 8192)
+        data_cfg, "max_doc_len", None
     )
 
     streaming = bool(data_cfg["streaming"])
