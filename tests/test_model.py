@@ -135,3 +135,19 @@ def test_gradient_checkpointing_matches_no_checkpointing():
         assert g0 is not None, f"missing grad for {name} (no-ckpt)"
         assert g1 is not None, f"missing grad for {name} (ckpt)"
         assert torch.allclose(g0, g1, atol=0.0, rtol=0.0), f"grad mismatch for {name}"
+
+
+def test_causal_mask_blocks_future_tokens(tiny_config):
+    torch.manual_seed(0)
+    model = GPTMini(tiny_config)
+    model.eval()
+
+    input_ids_a = torch.randint(0, tiny_config.vocab_size, (1, 8))
+    input_ids_b = input_ids_a.clone()
+    input_ids_b[0, -1] = (input_ids_b[0, -1] + 1) % tiny_config.vocab_size
+
+    with torch.no_grad():
+        logits_a = model(input_ids_a)
+        logits_b = model(input_ids_b)
+
+    assert torch.allclose(logits_a[:, :-1, :], logits_b[:, :-1, :], atol=0.0, rtol=0.0)

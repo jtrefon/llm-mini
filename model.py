@@ -236,7 +236,7 @@ class GQAMultiheadAttention(nn.Module):
                 q_3d,
                 k_3d,
                 v_3d,
-                attn_mask=attn_mask_t,
+                attn_mask=None if attn_mask_t is None else ~attn_mask_t,
                 dropout_p=self.dropout.p if self.training else 0.0,
                 is_causal=False,
             )
