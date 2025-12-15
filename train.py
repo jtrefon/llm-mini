@@ -10,6 +10,7 @@ import glob
 import warnings
 from typing import Optional, List, Any, Dict
 import time
+import sys
 
 import torch
 import pytorch_lightning as pl
@@ -256,24 +257,49 @@ def find_latest_checkpoint(config_ckpt_dir: str = 'checkpoints') -> Optional[str
 
 class MetricsLoggingCallback(pl.Callback):
     """Logs key metrics to a rotating timestamped file in logs/ directory."""
-    def __init__(self, log_file: Path):
+    def __init__(self, log_file: Path, print_to_stdout: bool = False):
         super().__init__()
         self.log_file = log_file
+        self._print_to_stdout = bool(print_to_stdout)
         self._header_written = False
+        self._train_batches_seen = 0
         self._last_logged_step: Optional[int] = None
         self._last_log_time_s: Optional[float] = None
+        self._last_logged_train_batches_seen: int = 0
+        self._last_train_loss_step: Optional[float] = None
+        self._last_val_loss: Optional[float] = None
+        self._last_val_ppl: Optional[float] = None
+
+    def _format_eta(self, seconds: Optional[float]) -> str:
+        if seconds is None:
+            return "-"
+        try:
+            if not math.isfinite(seconds) or seconds < 0:
+                return "-"
+            s = int(seconds)
+        except Exception:
+            return "-"
+        h = s // 3600
+        m = (s % 3600) // 60
+        s = s % 60
+        if h > 0:
+            return f"{h:d}:{m:02d}:{s:02d}"
+        return f"{m:d}:{s:02d}"
 
     def on_fit_start(self, trainer, pl_module):
         if trainer.is_global_zero and not self._header_written:
-            self._append_line("timestamp | step | epoch | kind | train_loss | val_loss | val_ppl | lr")
+            self._append_line("timestamp | kind | step | max_steps | progress | eta | epoch | train_batches | mb_per_s | tok_per_s | train_loss_step | val_loss | val_ppl | lr")
             self._header_written = True
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if not trainer.is_global_zero:
             return
+
+        self._train_batches_seen += 1
+
         tcfg = getattr(pl_module, "cfg", {}).get("training", {}) if hasattr(pl_module, "cfg") else {}
         every_steps = int(tcfg.get("metrics_log_every_n_steps", 50) or 50)
-        every_secs = float(tcfg.get("metrics_log_every_seconds", 20) or 20)
+        every_secs = float(tcfg.get("metrics_log_every_seconds", 60) or 60)
         step = int(trainer.global_step)
 
         now = time.monotonic()
@@ -293,35 +319,76 @@ class MetricsLoggingCallback(pl.Callback):
             return
 
         metrics = trainer.callback_metrics
-        train_loss = metrics.get("train_loss")
+        train_loss_step = metrics.get("train_loss_step")
+        if train_loss_step is None:
+            train_loss_step = metrics.get("train_loss")
+        if train_loss_step is not None:
+            try:
+                self._last_train_loss_step = float(train_loss_step)
+            except Exception:
+                pass
+
         lr = None
         if trainer.optimizers:
             try:
                 lr = trainer.optimizers[0].param_groups[0].get("lr", None)
             except Exception:
                 lr = None
+
+        dt = max(1e-6, now - float(self._last_log_time_s))
+        mb_delta = max(0, int(self._train_batches_seen) - int(self._last_logged_train_batches_seen))
+        mb_per_s = float(mb_delta) / dt
+        micro_bsz = int(getattr(pl_module, "cfg", {}).get("training", {}).get("micro_batch_size", 1) or 1)
+        seq_len = int(getattr(pl_module, "cfg", {}).get("training", {}).get("seq_len", 0) or 0)
+        tok_per_s = float(micro_bsz * seq_len) * mb_per_s if seq_len > 0 else 0.0
+        grad_accum = int(tcfg.get("grad_accum_steps", 1) or 1)
+        opt_steps_per_s = (mb_per_s / float(grad_accum)) if grad_accum > 0 else 0.0
+
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         epoch = int(trainer.current_epoch)
-        line = f"{ts} | step={step} | epoch={epoch} | kind=train | batch_idx={int(batch_idx)}"
-        line += f" | train_loss={float(train_loss):.4f}" if train_loss is not None else " | train_loss=-"
-        line += " | val_loss=- | val_ppl=-"
+        max_steps = int(getattr(trainer, "max_steps", 0) or 0)
+        if max_steps > 0:
+            pct = 100.0 * float(step) / float(max_steps)
+            progress = f"{pct:.2f}%"
+            eta_s = (float(max_steps - step) / opt_steps_per_s) if opt_steps_per_s > 0 else None
+        else:
+            progress = "-"
+            eta_s = None
+        eta = self._format_eta(eta_s)
+
+        line = f"{ts} | kind=train | step={step} | max_steps={max_steps} | progress={progress} | eta={eta} | epoch={epoch}"
+        line += f" | train_batches={int(self._train_batches_seen)} | mb_per_s={mb_per_s:.2f} | tok_per_s={tok_per_s:.0f}"
+        line += f" | train_loss_step={float(self._last_train_loss_step):.6g}" if self._last_train_loss_step is not None else " | train_loss_step=-"
+        line += f" | val_loss={float(self._last_val_loss):.6g}" if self._last_val_loss is not None else " | val_loss=-"
+        line += f" | val_ppl={float(self._last_val_ppl):.6g}" if self._last_val_ppl is not None else " | val_ppl=-"
         line += f" | lr={float(lr):.6g}" if isinstance(lr, (int, float)) else " | lr=-"
         self._append_line(line)
-        try:
-            print(line)
-        except Exception:
-            pass
+        if self._print_to_stdout:
+            try:
+                trainer.print(line)
+            except Exception:
+                pass
 
         self._last_logged_step = step
         self._last_log_time_s = now
+        self._last_logged_train_batches_seen = int(self._train_batches_seen)
 
     def on_validation_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
             return
         metrics = trainer.callback_metrics
-        train_loss_epoch = metrics.get("train_loss_epoch")
         val_loss = metrics.get("val_loss")
         val_ppl = metrics.get("val_ppl")
+        if val_loss is not None:
+            try:
+                self._last_val_loss = float(val_loss)
+            except Exception:
+                pass
+        if val_ppl is not None:
+            try:
+                self._last_val_ppl = float(val_ppl)
+            except Exception:
+                pass
         lr = None
         if trainer.optimizers:
             try:
@@ -331,16 +398,23 @@ class MetricsLoggingCallback(pl.Callback):
         step = int(trainer.global_step)
         epoch = int(trainer.current_epoch)
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        line = f"{ts} | step={step} | epoch={epoch} | kind=val"
-        line += f" | train_loss={float(train_loss_epoch):.4f}" if train_loss_epoch is not None else " | train_loss=-"
-        line += f" | val_loss={float(val_loss):.4f}" if val_loss is not None else " | val_loss=-"
-        line += f" | val_ppl={float(val_ppl):.4f}" if val_ppl is not None else " | val_ppl=-"
+        max_steps = int(getattr(trainer, "max_steps", 0) or 0)
+        if max_steps > 0:
+            pct = 100.0 * float(step) / float(max_steps)
+            progress = f"{pct:.2f}%"
+        else:
+            progress = "-"
+        line = f"{ts} | kind=val | step={step} | max_steps={max_steps} | progress={progress} | eta=- | epoch={epoch}"
+        line += f" | train_loss_step={float(self._last_train_loss_step):.6g}" if self._last_train_loss_step is not None else " | train_loss_step=-"
+        line += f" | val_loss={float(self._last_val_loss):.6g}" if self._last_val_loss is not None else " | val_loss=-"
+        line += f" | val_ppl={float(self._last_val_ppl):.6g}" if self._last_val_ppl is not None else " | val_ppl=-"
         line += f" | lr={float(lr):.6g}" if isinstance(lr, (int, float)) else " | lr=-"
         self._append_line(line)
-        try:
-            print(line)
-        except Exception:
-            pass
+        if self._print_to_stdout:
+            try:
+                trainer.print(line)
+            except Exception:
+                pass
 
     def _append_line(self, text: str):
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -413,7 +487,9 @@ def main(config_path='config.yaml'):
     # File logging
     log_file = setup_logging()
     print(f"Training logs: {log_file}")
-    metrics_logger_cb = MetricsLoggingCallback(log_file)
+    print_metrics_cfg = cfg.get('training', {}).get('print_metrics', None)
+    print_to_stdout = (not sys.stdout.isatty()) if print_metrics_cfg is None else bool(print_metrics_cfg)
+    metrics_logger_cb = MetricsLoggingCallback(log_file, print_to_stdout=print_to_stdout)
 
     # Resume logic: auto-resume from latest if exists
     ckpt_dir = cfg['training'].get('checkpoint_dir', 'checkpoints')
@@ -439,7 +515,7 @@ def main(config_path='config.yaml'):
     # Callbacks
     checkpoint_kwargs = dict(
         dirpath=ckpt_dir,
-        filename='{epoch}-{step}-{val_loss:.3f}',
+        filename='epoch={epoch}-step={step}-val_loss={val_loss:.3f}',
         save_top_k=1,
         monitor='val_loss',
         mode='min',
@@ -497,7 +573,7 @@ def main(config_path='config.yaml'):
         log_every_n_steps=cfg['training'].get('log_every_n_steps', 10),
         logger=pl.loggers.CSVLogger("logs"),
         enable_model_summary=bool(cfg['training'].get('enable_model_summary', False)),
-        enable_progress_bar=bool(cfg['training'].get('enable_progress_bar', True)),
+        enable_progress_bar=bool(cfg['training'].get('enable_progress_bar', sys.stdout.isatty())),
         enable_checkpointing=True,
         callbacks=callbacks,
         gradient_clip_val=cfg['training'].get('gradient_clip_val', 1.0),
