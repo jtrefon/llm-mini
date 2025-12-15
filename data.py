@@ -458,7 +458,7 @@ def get_tokenizer(cfg: Dict[str, Any]):
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token if tok.eos_token is not None else tok.unk_token
     try:
-        tok.model_max_length = int(cfg["training"]["seq_len"])
+        tok.model_max_length = int(1e9)
     except Exception:
-        tok.model_max_length = 1024
+        pass
     return tok
