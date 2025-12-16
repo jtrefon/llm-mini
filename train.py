@@ -236,6 +236,16 @@ def find_latest_checkpoint(config_ckpt_dir: str = 'checkpoints') -> Optional[str
     if not checkpoints:
         return None
 
+    # Prefer explicit "last" checkpoints if they exist; these are the right choice
+    # for continuing training because they include the latest optimizer/scheduler state.
+    # They often don't encode step in filename (e.g. last.ckpt, last-v2.ckpt), so
+    # step-parsing would incorrectly deprioritize them.
+    last_candidates = glob.glob(os.path.join(config_ckpt_dir, "last*.ckpt"))
+    last_candidates = [p for p in last_candidates if os.path.isfile(p)]
+    if last_candidates:
+        last_candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return last_candidates[0]
+
     def parse_step(path: str) -> int:
         name = os.path.basename(path)
         m = re.search(r"step=(\d+)", name)
