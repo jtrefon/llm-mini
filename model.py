@@ -202,17 +202,43 @@ class GQAMultiheadAttention(nn.Module):
             .reshape(B * self.n_heads, v_expand.size(1), self.head_dim)
         )
 
-        # Build mask for training path (Tq==Tk) only
+        use_sdpa_is_causal = (
+            (x.device.type != "mps")
+            and (not use_cache)
+            and bool(causal)
+            and (swa_window <= 0)
+            and (attn_mask is None)
+        )
+
+        # Build mask for training path (Tq==Tk) only when needed.
+        # If we can use SDPA's built-in causal masking, avoid passing an explicit mask
+        # to enable fused kernels (FlashAttention on CUDA).
         attn_mask_t = None
-        if not use_cache and (causal or swa_window > 0):
+        if (
+            (not use_cache)
+            and (not use_sdpa_is_causal)
+            and (bool(causal) or (swa_window > 0) or (attn_mask is not None))
+        ):
             T = Tq  # equals Tk in training path
-            causal_mask = torch.ones(T, T, device=x.device, dtype=torch.bool).triu(1)
+            causal_mask = (
+                torch.ones(T, T, device=x.device, dtype=torch.bool).triu(1)
+                if causal
+                else torch.zeros(T, T, device=x.device, dtype=torch.bool)
+            )
             if swa_window and swa_window > 0:
                 idx = torch.arange(T, device=x.device)
                 older_than_w = (idx.view(-1, 1) - idx.view(1, -1)) > swa_window
                 attn_mask_t = causal_mask | older_than_w
             else:
                 attn_mask_t = causal_mask
+
+        attn_mask_sdpa = None
+        if attn_mask_t is not None:
+            attn_mask_sdpa = torch.zeros(
+                attn_mask_t.shape,
+                device=x.device,
+                dtype=q_3d.dtype,
+            ).masked_fill(attn_mask_t, float("-inf"))
 
         # Attention: prefer manual math on MPS for stability; use SDPA elsewhere
         if x.device.type == "mps":
@@ -236,9 +262,9 @@ class GQAMultiheadAttention(nn.Module):
                 q_3d,
                 k_3d,
                 v_3d,
-                attn_mask=None if attn_mask_t is None else ~attn_mask_t,
+                attn_mask=None if use_sdpa_is_causal else attn_mask_sdpa,
                 dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False,
+                is_causal=use_sdpa_is_causal,
             )
 
         attn = (

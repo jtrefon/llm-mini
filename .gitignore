@@ -1,7 +1,7 @@
 .venv
 lightning_logs/
 checkpoints/
-__pycache__
+__pycache__/
 logs/
 *.DS_Store
 .pytest_cache
