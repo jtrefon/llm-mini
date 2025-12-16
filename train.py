@@ -69,6 +69,7 @@ class LitCausalLM(pl.LightningModule):
         )
         self.net = GPTMini(mcfg)
         self._compiled_forward = None
+        self._using_fused_adamw = False
         tcfg = cfg.get("training", {})
         compile_cfg = tcfg.get("torch_compile", None)
         accelerator = str(cfg.get("hardware", {}).get("accelerator", "auto")).lower()
@@ -165,6 +166,18 @@ class LitCausalLM(pl.LightningModule):
         self.log('val_ppl', ppl, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
+    def configure_gradient_clipping(
+        self,
+        optimizer: torch.optim.Optimizer,
+        gradient_clip_val: Optional[float] = None,
+        gradient_clip_algorithm: Optional[str] = None,
+    ) -> None:
+        if getattr(self, "_using_fused_adamw", False):
+            return
+        return super().configure_gradient_clipping(
+            optimizer, gradient_clip_val, gradient_clip_algorithm
+        )
+
     def configure_optimizers(self):
         # Parameter groups: apply weight decay to weights (ndim>=2), not to biases/norms
         wd = float(self.cfg['training']['weight_decay'])
@@ -204,11 +217,14 @@ class LitCausalLM(pl.LightningModule):
                     fused=True,
                 )
                 print("[Train] Using fused AdamW")
+                self._using_fused_adamw = True
             except Exception as exc:
                 optimizer = AdamW(param_groups, lr=lr, betas=betas, eps=eps)
                 print(f"[Train] Fused AdamW unavailable; falling back: {exc}")
+                self._using_fused_adamw = False
         else:
             optimizer = AdamW(param_groups, lr=lr, betas=betas, eps=eps)
+            self._using_fused_adamw = False
 
         lr_schedule = str(self.cfg["training"].get("lr_schedule", "warmup_cosine")).lower()
         if lr_schedule in {"warmup_cosine", "cosine"}:
