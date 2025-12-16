@@ -1,4 +1,5 @@
 import math
+import inspect
 from dataclasses import dataclass
 from typing import Optional, Tuple, Any
 
@@ -6,6 +7,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+
+try:
+    _SDPA_HAS_ENABLE_GQA = (
+        "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+    )
+except (TypeError, ValueError):
+    _SDPA_HAS_ENABLE_GQA = False
 
 
 # ---- RMSNorm (lighter than LayerNorm)
@@ -183,24 +192,32 @@ class GQAMultiheadAttention(nn.Module):
                 k = k[:, -swa_window:, :, :]
                 v = v[:, -swa_window:, :, :]
 
-        # Expand k,v from KV heads to Q heads (repeat per group)
-        if self.n_kv_heads != self.n_heads:
-            k_expand = k.repeat_interleave(self.group_size, dim=2)
-            v_expand = v.repeat_interleave(self.group_size, dim=2)
-        else:
-            k_expand = k
-            v_expand = v
+        use_true_gqa = (
+            (x.device.type == "cuda")
+            and (self.n_kv_heads != self.n_heads)
+            and _SDPA_HAS_ENABLE_GQA
+        )
 
-        # SDPA expects [B*H, T, D]
-        q_3d = q.permute(0, 2, 1, 3).reshape(B * self.n_heads, Tq, self.head_dim)
-        k_3d = (
-            k_expand.permute(0, 2, 1, 3)
-            .reshape(B * self.n_heads, k_expand.size(1), self.head_dim)
-        )
-        v_3d = (
-            v_expand.permute(0, 2, 1, 3)
-            .reshape(B * self.n_heads, v_expand.size(1), self.head_dim)
-        )
+        q_4d = q.permute(0, 2, 1, 3)
+        if use_true_gqa:
+            k_4d = k.permute(0, 2, 1, 3)
+            v_4d = v.permute(0, 2, 1, 3)
+        else:
+            # Expand k,v from KV heads to Q heads (repeat per group)
+            if self.n_kv_heads != self.n_heads:
+                k_expand = k.repeat_interleave(self.group_size, dim=2)
+                v_expand = v.repeat_interleave(self.group_size, dim=2)
+            else:
+                k_expand = k
+                v_expand = v
+
+            k_4d = k_expand.permute(0, 2, 1, 3)
+            v_4d = v_expand.permute(0, 2, 1, 3)
+
+            # SDPA expects [B*H, T, D]
+            q_3d = q_4d.reshape(B * self.n_heads, Tq, self.head_dim)
+            k_3d = k_4d.reshape(B * self.n_heads, k_4d.size(2), self.head_dim)
+            v_3d = v_4d.reshape(B * self.n_heads, v_4d.size(2), self.head_dim)
 
         use_sdpa_is_causal = (
             (x.device.type != "mps")
@@ -237,7 +254,7 @@ class GQAMultiheadAttention(nn.Module):
             attn_mask_sdpa = torch.zeros(
                 attn_mask_t.shape,
                 device=x.device,
-                dtype=q_3d.dtype,
+                dtype=q_4d.dtype,
             ).masked_fill(attn_mask_t, float("-inf"))
 
         # Attention: prefer manual math on MPS for stability; use SDPA elsewhere
@@ -258,21 +275,35 @@ class GQAMultiheadAttention(nn.Module):
                 weights = self.dropout(weights)
             attn = torch.bmm(weights, vf).to(q_3d.dtype)
         else:
-            attn = F.scaled_dot_product_attention(
-                q_3d,
-                k_3d,
-                v_3d,
-                attn_mask=None if use_sdpa_is_causal else attn_mask_sdpa,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=use_sdpa_is_causal,
-            )
+            if use_true_gqa:
+                attn = F.scaled_dot_product_attention(
+                    q_4d,
+                    k_4d,
+                    v_4d,
+                    attn_mask=None if use_sdpa_is_causal else attn_mask_sdpa,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=use_sdpa_is_causal,
+                    enable_gqa=True,
+                )
+            else:
+                attn = F.scaled_dot_product_attention(
+                    q_3d,
+                    k_3d,
+                    v_3d,
+                    attn_mask=None if use_sdpa_is_causal else attn_mask_sdpa,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=use_sdpa_is_causal,
+                )
 
-        attn = (
-            attn.reshape(B, self.n_heads, Tq, self.head_dim)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-            .view(B, Tq, C)
-        )
+        if attn.dim() == 4:
+            attn = attn.permute(0, 2, 1, 3).contiguous().view(B, Tq, C)
+        else:
+            attn = (
+                attn.reshape(B, self.n_heads, Tq, self.head_dim)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .view(B, Tq, C)
+            )
         out = self.out(attn)
 
         if use_cache:

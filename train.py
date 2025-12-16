@@ -68,13 +68,52 @@ class LitCausalLM(pl.LightningModule):
             gradient_checkpointing=bool(cfg['model'].get('gradient_checkpointing', False)),
         )
         self.net = GPTMini(mcfg)
+        self._compiled_forward = None
+        tcfg = cfg.get("training", {})
+        compile_cfg = tcfg.get("torch_compile", None)
+        accelerator = str(cfg.get("hardware", {}).get("accelerator", "auto")).lower()
+        if compile_cfg is None:
+            self._torch_compile_enabled = bool(
+                (accelerator in {"cuda", "auto"}) and torch.cuda.is_available()
+            )
+        else:
+            self._torch_compile_enabled = bool(compile_cfg)
+        self._torch_compile_mode = str(tcfg.get("torch_compile_mode", "max-autotune"))
         
         # Cap model size ~200M params for lightweight usage
         param_count = sum(p.numel() for p in self.net.parameters())
         print(f"Model initialized with {param_count:,} parameters")
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self._compiled_forward is not None:
+            return self._compiled_forward(input_ids)
         return self.net(input_ids)
+
+    def on_fit_start(self) -> None:
+        if not getattr(self, "_torch_compile_enabled", False):
+            return
+        if self._compiled_forward is not None:
+            return
+        if getattr(self, "device", None) is None or self.device.type != "cuda":
+            return
+        compile_fn = getattr(torch, "compile", None)
+        if compile_fn is None:
+            return
+        try:
+            self._compiled_forward = torch.compile(
+                self.net.forward, mode=self._torch_compile_mode
+            )
+            print(f"[Train] torch.compile enabled (mode={self._torch_compile_mode})")
+        except TypeError:
+            try:
+                self._compiled_forward = torch.compile(self.net.forward)
+                print("[Train] torch.compile enabled")
+            except Exception as exc:
+                self._compiled_forward = None
+                print(f"[Train] torch.compile failed; continuing without: {exc}")
+        except Exception as exc:
+            self._compiled_forward = None
+            print(f"[Train] torch.compile failed; continuing without: {exc}")
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         input_ids = batch['input_ids']
@@ -117,10 +156,33 @@ class LitCausalLM(pl.LightningModule):
             else:
                 nodecay_params.append(p)
 
-        optimizer = AdamW([
+        param_groups = [
             {'params': decay_params, 'weight_decay': wd},
             {'params': nodecay_params, 'weight_decay': 0.0},
-        ], lr=lr, betas=betas, eps=eps)
+        ]
+        tcfg = self.cfg.get("training", {})
+        fused_cfg = tcfg.get("fused_adamw", None)
+        accelerator = str(self.cfg.get("hardware", {}).get("accelerator", "auto")).lower()
+        if fused_cfg is None:
+            want_fused = bool((accelerator in {"cuda", "auto"}) and torch.cuda.is_available())
+        else:
+            want_fused = bool(fused_cfg)
+
+        if want_fused:
+            try:
+                optimizer = AdamW(
+                    param_groups,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    fused=True,
+                )
+                print("[Train] Using fused AdamW")
+            except Exception as exc:
+                optimizer = AdamW(param_groups, lr=lr, betas=betas, eps=eps)
+                print(f"[Train] Fused AdamW unavailable; falling back: {exc}")
+        else:
+            optimizer = AdamW(param_groups, lr=lr, betas=betas, eps=eps)
 
         lr_schedule = str(self.cfg["training"].get("lr_schedule", "warmup_cosine")).lower()
         if lr_schedule in {"warmup_cosine", "cosine"}:

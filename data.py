@@ -324,7 +324,15 @@ def make_dataloaders(
             num_workers = num_workers_cfg
         pin_memory = True
         persistent = bool(num_workers > 0)
-        prefetch = 1 if persistent else None
+        prefetch_cfg = cfg.get("hardware", {}).get("prefetch_factor", None)
+        if prefetch_cfg is None:
+            prefetch = 2 if persistent else None
+        else:
+            try:
+                prefetch_int = int(prefetch_cfg)
+            except Exception:
+                prefetch_int = 0
+            prefetch = prefetch_int if (persistent and prefetch_int > 0) else None
 
     if streaming:
         print("Using streaming IterableDataset to avoid loading full corpus into memory")
