@@ -78,7 +78,7 @@ class LitCausalLM(pl.LightningModule):
             )
         else:
             self._torch_compile_enabled = bool(compile_cfg)
-        self._torch_compile_mode = str(tcfg.get("torch_compile_mode", "max-autotune"))
+        self._torch_compile_mode = str(tcfg.get("torch_compile_mode", "default"))
         
         # Cap model size ~200M params for lightweight usage
         param_count = sum(p.numel() for p in self.net.parameters())
@@ -86,6 +86,13 @@ class LitCausalLM(pl.LightningModule):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self._compiled_forward is not None:
+            compiler_mod = getattr(torch, "compiler", None)
+            mark_step_begin = getattr(compiler_mod, "cudagraph_mark_step_begin", None)
+            if mark_step_begin is not None:
+                try:
+                    mark_step_begin()
+                except Exception:
+                    pass
             return self._compiled_forward(input_ids)
         return self.net(input_ids)
 
@@ -99,6 +106,25 @@ class LitCausalLM(pl.LightningModule):
         compile_fn = getattr(torch, "compile", None)
         if compile_fn is None:
             return
+
+        try:
+            seq_len = int(self.cfg.get("training", {}).get("seq_len", 0) or 0)
+        except Exception:
+            seq_len = 0
+        if seq_len > 0:
+            try:
+                head_dim = int(self.net.config.d_model) // int(self.net.config.n_heads)
+                with torch.no_grad():
+                    self.net._maybe_build_rope(
+                        seq_len,
+                        head_dim,
+                        float(self.net.config.rope_theta),
+                        self.device,
+                        torch.float32,
+                    )
+            except Exception as exc:
+                print(f"[Train] RoPE cache prebuild failed; continuing: {exc}")
+
         try:
             self._compiled_forward = torch.compile(
                 self.net.forward, mode=self._torch_compile_mode
