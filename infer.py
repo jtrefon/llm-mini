@@ -140,6 +140,7 @@ if __name__ == '__main__':
     parser.add_argument('--prompt', type=str, default='Once upon a time')
     parser.add_argument('--instruct', action='store_true', help='Force-wrap the prompt in an Alpaca-style template (auto-detected otherwise).')
     parser.add_argument('--no_wrap', action='store_true', help='Disable Alpaca-style prompt wrapping entirely (raw completion mode).')
+    parser.add_argument('--disable_eos', action='store_true', help='Disable EOS stopping (useful if generations end too early).')
     parser.add_argument('--max_new_tokens', type=int, default=128)
     parser.add_argument('--temperature', type=float, default=0.2)
     parser.add_argument('--top_p', type=float, default=0.9)
@@ -165,6 +166,11 @@ if __name__ == '__main__':
                 args.prompt = f"### Instruction:\n{user}\n\n### Response:\n"
 
     model, tok, dev = load_from_lightning_ckpt(args.ckpt, tokenizer_name=args.tokenizer, device=args.device)
+    if args.disable_eos:
+        try:
+            tok.eos_token_id = None
+        except Exception:
+            pass
     text = generate_text(
         model,
         tok,
