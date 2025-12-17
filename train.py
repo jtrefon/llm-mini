@@ -351,6 +351,85 @@ class WarmupLRCallback(pl.Callback):
             g['lr'] = base * frac
 
 
+class ResetLROnResumeCallback(pl.Callback):
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__()
+        self._cfg = cfg
+        self._resume_step: Optional[int] = None
+        self._done = False
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        try:
+            step = checkpoint.get("global_step", None)
+        except Exception:
+            step = None
+        if step is None:
+            return
+        try:
+            self._resume_step = int(step)
+        except Exception:
+            self._resume_step = None
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if self._done:
+            return
+        if self._resume_step is None:
+            return
+        try:
+            step_now = int(getattr(trainer, "global_step", 0) or 0)
+        except Exception:
+            step_now = 0
+        if step_now < int(self._resume_step):
+            return
+
+        tcfg = self._cfg.get("training", {})
+        lr_schedule = str(tcfg.get("lr_schedule", "warmup_cosine")).lower()
+        if lr_schedule not in {"warmup_cosine", "cosine"}:
+            self._done = True
+            return
+
+        if not trainer.optimizers:
+            self._done = True
+            return
+        opt = trainer.optimizers[0]
+
+        base_lr = float(tcfg.get("lr", 0.0) or 0.0)
+        warmup_ratio = float(tcfg.get("warmup_ratio", 0.0) or 0.0)
+        max_steps = int(tcfg.get("max_steps", 0) or 0)
+        min_lr_ratio = float(tcfg.get("min_lr_ratio", 0.0) or 0.0)
+        if max_steps <= 0 or base_lr <= 0:
+            self._done = True
+            return
+
+        mult = WarmupCosine(warmup_ratio, max_steps, min_lr_ratio=min_lr_ratio)(step_now)
+        new_lr = float(base_lr) * float(mult)
+        for pg in opt.param_groups:
+            pg["lr"] = new_lr
+
+        try:
+            lrs_cfgs = getattr(trainer, "lr_scheduler_configs", None)
+        except Exception:
+            lrs_cfgs = None
+        if lrs_cfgs:
+            for cfg in lrs_cfgs:
+                sch = getattr(cfg, "scheduler", None)
+                if sch is None:
+                    continue
+                try:
+                    sch.base_lrs = [base_lr for _ in opt.param_groups]
+                except Exception:
+                    pass
+                try:
+                    sch.last_epoch = int(step_now) - 1
+                except Exception:
+                    pass
+        try:
+            trainer.print(f"[Train] Reset LR on resume at step={step_now} -> lr={new_lr:.6g}")
+        except Exception:
+            pass
+        self._done = True
+
+
 def find_latest_checkpoint(config_ckpt_dir: str = 'checkpoints') -> Optional[str]:
     """Find the most advanced checkpoint by filename step parsing."""
     patterns = [
@@ -739,6 +818,9 @@ def main(config_path='config.yaml'):
         best_checkpoint_cb,
         metrics_logger_cb,
     ]
+
+    if bool(cfg.get("training", {}).get("reset_lr_on_resume", False)):
+        callbacks.insert(0, ResetLROnResumeCallback(cfg))
 
     # Optional: plateau scheduler mode (mutates optimizer LR via callback).
     if lr_schedule in {"plateau", "reduce_on_plateau"}:
