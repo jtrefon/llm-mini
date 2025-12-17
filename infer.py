@@ -139,6 +139,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='mps', choices=['mps','cuda','cpu'])
     parser.add_argument('--prompt', type=str, default='Once upon a time')
     parser.add_argument('--instruct', action='store_true', help='Force-wrap the prompt in an Alpaca-style template (auto-detected otherwise).')
+    parser.add_argument('--no_wrap', action='store_true', help='Disable Alpaca-style prompt wrapping entirely (raw completion mode).')
     parser.add_argument('--max_new_tokens', type=int, default=128)
     parser.add_argument('--temperature', type=float, default=0.2)
     parser.add_argument('--top_p', type=float, default=0.9)
@@ -157,10 +158,11 @@ if __name__ == '__main__':
             pass
 
     # Auto-wrap prompt in Alpaca-style envelope unless it's already enveloped.
-    if args.instruct or not is_alpaca_enveloped(args.prompt):
-        if not is_alpaca_enveloped(args.prompt):
-            user = args.prompt.strip()
-            args.prompt = f"### Instruction:\n{user}\n\n### Response:\n"
+    if not args.no_wrap:
+        if args.instruct or not is_alpaca_enveloped(args.prompt):
+            if not is_alpaca_enveloped(args.prompt):
+                user = args.prompt.strip()
+                args.prompt = f"### Instruction:\n{user}\n\n### Response:\n"
 
     model, tok, dev = load_from_lightning_ckpt(args.ckpt, tokenizer_name=args.tokenizer, device=args.device)
     text = generate_text(
