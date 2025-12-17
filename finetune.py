@@ -12,11 +12,7 @@ from transformers import AutoTokenizer
 from model import GPTMini, GPTConfig
 from train import (
     LitCausalLM,
-    WarmupCosine,
     WarmupLRCallback,
-    select_checkpoint_interactively,
-    discover_checkpoints,
-    find_latest_checkpoint,
 )  # reuse your existing LightningModule & checkpoint utilities
 
 class LitSFT(LitCausalLM):
