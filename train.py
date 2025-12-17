@@ -236,10 +236,11 @@ class LitCausalLM(pl.LightningModule):
         lr_schedule = str(self.cfg["training"].get("lr_schedule", "warmup_cosine")).lower()
         if lr_schedule in {"warmup_cosine", "cosine"}:
             max_steps = int(self.cfg["training"]["max_steps"])
+            lr_schedule_max_steps = int(self.cfg["training"].get("lr_schedule_max_steps", max_steps) or max_steps)
             warmup_ratio = float(self.cfg["training"].get("warmup_ratio", 0.0))
             min_lr_ratio = float(self.cfg["training"].get("min_lr_ratio", 0.0) or 0.0)
             scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda=WarmupCosine(warmup_ratio, max_steps, min_lr_ratio=min_lr_ratio)
+                optimizer, lr_lambda=WarmupCosine(warmup_ratio, lr_schedule_max_steps, min_lr_ratio=min_lr_ratio)
             )
             return {
                 "optimizer": optimizer,
@@ -396,12 +397,13 @@ class ResetLROnResumeCallback(pl.Callback):
         base_lr = float(tcfg.get("lr", 0.0) or 0.0)
         warmup_ratio = float(tcfg.get("warmup_ratio", 0.0) or 0.0)
         max_steps = int(tcfg.get("max_steps", 0) or 0)
+        lr_schedule_max_steps = int(tcfg.get("lr_schedule_max_steps", max_steps) or max_steps)
         min_lr_ratio = float(tcfg.get("min_lr_ratio", 0.0) or 0.0)
-        if max_steps <= 0 or base_lr <= 0:
+        if lr_schedule_max_steps <= 0 or base_lr <= 0:
             self._done = True
             return
 
-        mult = WarmupCosine(warmup_ratio, max_steps, min_lr_ratio=min_lr_ratio)(step_now)
+        mult = WarmupCosine(warmup_ratio, lr_schedule_max_steps, min_lr_ratio=min_lr_ratio)(step_now)
         new_lr = float(base_lr) * float(mult)
         for pg in opt.param_groups:
             pg["lr"] = new_lr
@@ -462,12 +464,13 @@ class WarmupCosineOnResumeCallback(pl.Callback):
         base_lr = float(tcfg.get("lr", 0.0) or 0.0)
         warmup_ratio = float(tcfg.get("warmup_ratio", 0.0) or 0.0)
         max_steps = int(tcfg.get("max_steps", 0) or 0)
+        lr_schedule_max_steps = int(tcfg.get("lr_schedule_max_steps", max_steps) or max_steps)
         min_lr_ratio = float(tcfg.get("min_lr_ratio", 0.0) or 0.0)
-        if base_lr <= 0.0 or max_steps <= 0:
+        if base_lr <= 0.0 or lr_schedule_max_steps <= 0:
             return
         if not trainer.optimizers:
             return
-        mult = WarmupCosine(warmup_ratio, max_steps, min_lr_ratio=min_lr_ratio)(step_now)
+        mult = WarmupCosine(warmup_ratio, lr_schedule_max_steps, min_lr_ratio=min_lr_ratio)(step_now)
         lr = float(base_lr) * float(mult)
         opt = trainer.optimizers[0]
         for pg in opt.param_groups:
@@ -757,13 +760,16 @@ def main(config_path='config.yaml'):
 
     tcfg = cfg.get("training", {})
     escfg = tcfg.get("early_stopping", {})
+    max_steps_print = tcfg.get("max_steps")
+    lr_schedule_max_steps_print = tcfg.get("lr_schedule_max_steps", max_steps_print)
     print(
         "[Config] "
         f"lr_schedule={tcfg.get('lr_schedule')} "
         f"lr={tcfg.get('lr')} "
         f"warmup_ratio={tcfg.get('warmup_ratio')} "
         f"min_lr_ratio={tcfg.get('min_lr_ratio', 0.0)} "
-        f"max_steps={tcfg.get('max_steps')} "
+        f"max_steps={max_steps_print} "
+        f"lr_schedule_max_steps={lr_schedule_max_steps_print} "
         f"es_enabled={escfg.get('enabled', True)} "
         f"es_patience={escfg.get('patience')} "
         f"es_min_delta={escfg.get('min_delta')}"
