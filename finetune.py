@@ -398,7 +398,7 @@ def main(config_path="config.yaml"):
         threshold=rop_cfg.get("threshold", 0.0),
         monitor="val_loss", mode="min", warmup_steps=warmup_steps
     )
-    lr_mon  = LearningRateMonitor(logging_interval="step")
+    lr_mon  = LearningRateMonitor(logging_interval="epoch")
 
     # Trainer settings
     # Align validation and snapshot saving with the end of each epoch ("epic end").
@@ -438,9 +438,10 @@ def main(config_path="config.yaml"):
             limit_train_batches = batches_per_epoch
         max_epochs = approx_epochs
 
+    os.makedirs("logs", exist_ok=True)
     loggers = [
-        TensorBoardLogger(save_dir=".", name="lightning_logs"),
-        CSVLogger(save_dir=".", name="lightning_logs"),
+        TensorBoardLogger(save_dir="logs", name="lightning_logs"),
+        CSVLogger(save_dir="logs", name="lightning_logs"),
     ]
     trainer = pl.Trainer(
         accelerator=accelerator,
