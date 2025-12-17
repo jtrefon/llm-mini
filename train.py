@@ -32,9 +32,14 @@ except Exception:
 
 
 class WarmupCosine:
-    def __init__(self, warmup_ratio: float, max_steps: int):
+    def __init__(self, warmup_ratio: float, max_steps: int, min_lr_ratio: float = 0.0):
         self.warmup_steps = max(1, int(warmup_ratio * max_steps))
         self.max_steps = max_steps
+        try:
+            r = float(min_lr_ratio)
+        except Exception:
+            r = 0.0
+        self.min_lr_ratio = min(1.0, max(0.0, r))
 
     def __call__(self, step: int) -> float:
         # Scheduler `step` is 0-indexed in most PyTorch schedulers; avoid returning 0
@@ -45,7 +50,9 @@ class WarmupCosine:
         denom = max(1, self.max_steps - self.warmup_steps)
         progress = (s - self.warmup_steps) / denom
         progress = min(1.0, max(0.0, float(progress)))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Apply an LR floor so the schedule approaches (min_lr_ratio * base_lr) at the end.
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cos
 
 
 class LitCausalLM(pl.LightningModule):
@@ -230,8 +237,9 @@ class LitCausalLM(pl.LightningModule):
         if lr_schedule in {"warmup_cosine", "cosine"}:
             max_steps = int(self.cfg["training"]["max_steps"])
             warmup_ratio = float(self.cfg["training"].get("warmup_ratio", 0.0))
+            min_lr_ratio = float(self.cfg["training"].get("min_lr_ratio", 0.0) or 0.0)
             scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda=WarmupCosine(warmup_ratio, max_steps)
+                optimizer, lr_lambda=WarmupCosine(warmup_ratio, max_steps, min_lr_ratio=min_lr_ratio)
             )
             return {
                 "optimizer": optimizer,
