@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 from datasets import load_dataset, Dataset as HFDataset
 from transformers import AutoTokenizer
 
@@ -198,17 +199,20 @@ def pick_checkpoint(ckpt_dir: str) -> Optional[str]:
 class ReduceLROnPlateauOnVal(pl.Callback):
     """Reduce LR when val_loss plateaus (uses your config thresholds)."""
     def __init__(self, patience=2, factor=0.5, min_lr=1e-6, cooldown=0, threshold=0.0,
-                 monitor="val_loss", mode="min"):
+                 monitor="val_loss", mode="min", warmup_steps: int = 0):
         self.patience = patience; self.factor = factor; self.min_lr = min_lr
         self.cooldown = cooldown; self.threshold = threshold
         self.monitor = monitor; self.mode = mode
         self.best = float("inf") if mode == "min" else -float("inf")
         self.bad = 0; self.cool = 0
+        self._warmup_steps = int(max(0, warmup_steps))
 
     def _improved(self, cur):
         return (self.best - cur) > self.threshold if self.mode == "min" else (cur - self.best) > self.threshold
 
     def on_validation_end(self, trainer, pl_module):
+        if trainer.global_step < self._warmup_steps:
+            return
         if self.monitor not in trainer.callback_metrics:
             return
         cur = float(trainer.callback_metrics[self.monitor])
@@ -385,13 +389,14 @@ def main(config_path="config.yaml"):
             check_on_train_epoch_end=False,
         )
     rop_cfg = cfg["training"].get("reduce_on_plateau", {"factor":0.5,"patience":2,"min_lr":1e-6,"cooldown":0,"threshold":0.0})
+    warmup_steps = int(cfg["training"].get("warmup_ratio", 0.03) * max_steps)
     rop_cb  = ReduceLROnPlateauOnVal(
         patience=rop_cfg.get("patience", 2),
         factor=  rop_cfg.get("factor", 0.5),
         min_lr=  rop_cfg.get("min_lr", 1e-6),
         cooldown=rop_cfg.get("cooldown", 0),
         threshold=rop_cfg.get("threshold", 0.0),
-        monitor="val_loss", mode="min"
+        monitor="val_loss", mode="min", warmup_steps=warmup_steps
     )
     lr_mon  = LearningRateMonitor(logging_interval="step")
 
@@ -407,7 +412,7 @@ def main(config_path="config.yaml"):
         ckpt_cb,
         rop_cb,
         lr_mon,
-        WarmupLRCallback(int(cfg["training"].get("warmup_ratio", 0.03) * max_steps)),
+        WarmupLRCallback(warmup_steps),
     ]
     if es_cb is not None:
         callbacks_list.insert(1, es_cb)
@@ -429,10 +434,14 @@ def main(config_path="config.yaml"):
         approx_epochs = 10
         steps_per_epoch = max(1, max_steps // approx_epochs)
         batches_per_epoch = steps_per_epoch * max(1, grad_accum_steps)
-        if limit_train_batches is None:
+        if limit_batches_cfg is None:
             limit_train_batches = batches_per_epoch
         max_epochs = approx_epochs
 
+    loggers = [
+        TensorBoardLogger(save_dir=".", name="lightning_logs"),
+        CSVLogger(save_dir=".", name="lightning_logs"),
+    ]
     trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
@@ -446,6 +455,7 @@ def main(config_path="config.yaml"):
         check_val_every_n_epoch=1,
         limit_train_batches=limit_train_batches,
         num_sanity_val_steps=0,
+        logger=loggers,
         callbacks=callbacks_list,
     )
 
