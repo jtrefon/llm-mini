@@ -578,8 +578,30 @@ class RobustEarlyStopping(EarlyStopping):
 
 class EarlyStoppingRespectConfig(RobustEarlyStopping):
     def __init__(self, *args, warmup_steps: int = 0, **kwargs):
+        self._configured_patience = int(kwargs.get("patience", 0) or 0)
+        self._configured_min_delta = float(kwargs.get("min_delta", 0.0) or 0.0)
         super().__init__(*args, **kwargs)
         self._warmup_steps = int(max(0, warmup_steps))
+
+    def load_state_dict(self, state_dict):
+        # When resuming, Lightning restores EarlyStopping internal counters such as
+        # wait_count. If you change patience between runs, the restored wait_count can
+        # cause an immediate stop (e.g. stop after only a few validations). We keep the
+        # restored best score, but reset the counter and re-apply configured thresholds.
+        super().load_state_dict(state_dict)
+        try:
+            if self._configured_patience > 0:
+                self.patience = int(self._configured_patience)
+        except Exception:
+            pass
+        try:
+            self.min_delta = float(self._configured_min_delta)
+        except Exception:
+            pass
+        try:
+            self.wait_count = 0
+        except Exception:
+            pass
 
     def on_train_epoch_end(self, trainer, pl_module):
         if trainer.global_step < self._warmup_steps:
