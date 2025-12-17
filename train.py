@@ -626,6 +626,20 @@ def main(config_path='config.yaml'):
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
 
+    tcfg = cfg.get("training", {})
+    escfg = tcfg.get("early_stopping", {})
+    print(
+        "[Config] "
+        f"lr_schedule={tcfg.get('lr_schedule')} "
+        f"lr={tcfg.get('lr')} "
+        f"warmup_ratio={tcfg.get('warmup_ratio')} "
+        f"min_lr_ratio={tcfg.get('min_lr_ratio', 0.0)} "
+        f"max_steps={tcfg.get('max_steps')} "
+        f"es_enabled={escfg.get('enabled', True)} "
+        f"es_patience={escfg.get('patience')} "
+        f"es_min_delta={escfg.get('min_delta')}"
+    )
+
     # Suppress specific PyTorch Lightning warnings
     warnings.filterwarnings("ignore", message="You're resuming from a checkpoint that ended before the epoch ended")
     pl.seed_everything(cfg['training']['seed'])
