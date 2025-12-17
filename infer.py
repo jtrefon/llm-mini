@@ -23,6 +23,10 @@ def load_from_lightning_ckpt(ckpt_path: str, tokenizer_name: str, device: str = 
     tokenizer = AutoTokenizer.from_pretrained(effective_tok_name, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token if tokenizer.eos_token is not None else tokenizer.unk_token
+    try:
+        tokenizer.model_max_length = int(1e9)
+    except Exception:
+        pass
 
     # Pull model dims from saved hyperparameters; fall back to safe defaults if needed
     model_cfg = hparams.get('model', {}) if isinstance(hparams, dict) else {}
@@ -53,7 +57,19 @@ def load_from_lightning_ckpt(ckpt_path: str, tokenizer_name: str, device: str = 
     except Exception:
         pass
 
-    dev = torch.device('mps' if device == 'mps' and torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() and device != 'cpu' else 'cpu')
+    preferred = (device or "auto").lower()
+    mps_available = bool(
+        getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+    )
+    cuda_available = torch.cuda.is_available()
+    if preferred == "cuda":
+        dev = torch.device("cuda" if cuda_available else ("mps" if mps_available else "cpu"))
+    elif preferred == "mps":
+        dev = torch.device("mps" if mps_available else ("cuda" if cuda_available else "cpu"))
+    elif preferred == "cpu":
+        dev = torch.device("cpu")
+    else:
+        dev = torch.device("cuda" if cuda_available else ("mps" if mps_available else "cpu"))
     model.to(dev)
     model.eval()
     return model, tokenizer, dev

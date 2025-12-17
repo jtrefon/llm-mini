@@ -112,15 +112,37 @@ def _format_token(token: str) -> str:
     return repr(safe)
 
 
-def _maybe_load_cases(path: Optional[str]) -> List[TestCase]:
-    if not path:
-        return [TestCase(**c) for c in DEFAULT_CASES]
+def _expand_case_files(spec: str) -> List[Path]:
+    """Expand a case spec into concrete files.
 
-    file_path = Path(path)
-    if not file_path.exists():
-        print(f"[warn] cases file not found at {file_path}, falling back to built-in defaults.")
-        return [TestCase(**c) for c in DEFAULT_CASES]
+    Supports:
+    - glob patterns (e.g. "cases/*.yaml")
+    - directories (e.g. "cases/")
+    - comma-separated lists (e.g. "cases/a.yaml,cases/b.yaml")
+    """
 
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    paths: List[Path] = []
+    for part in parts:
+        part_path = Path(part)
+        if part_path.is_dir():
+            for ext in ("*.yaml", "*.yml", "*.json"):
+                paths.extend(Path(p) for p in glob(str(part_path / ext)))
+            continue
+
+        matches = glob(part)
+        if matches:
+            paths.extend(Path(p) for p in matches)
+            continue
+
+        if part_path.exists():
+            paths.append(part_path)
+
+    deduped = sorted(set(paths))
+    return [p for p in deduped if p.is_file()]
+
+
+def _load_cases_file(file_path: Path) -> List[TestCase]:
     data = None
     if file_path.suffix.lower() in {".json"}:
         data = json.loads(file_path.read_text())
@@ -129,19 +151,35 @@ def _maybe_load_cases(path: Optional[str]) -> List[TestCase]:
             raise RuntimeError("pyyaml is required to load YAML cases")
         data = yaml.safe_load(file_path.read_text())
     else:
-        raise ValueError("Cases file must be .json or .yaml/.yml")
+        raise ValueError(f"Cases file must be .json or .yaml/.yml, got: {file_path}")
 
     if not isinstance(data, Iterable):
-        raise ValueError("Cases file must contain a list of prompts")
+        raise ValueError(f"Cases file must contain a list of prompts: {file_path}")
+
     cases: List[TestCase] = []
     for raw in data:
         if not isinstance(raw, dict) or "prompt" not in raw:
-            raise ValueError("Each case must be a mapping with at least a 'prompt' field")
+            raise ValueError(f"Each case must be a mapping with at least a 'prompt' field: {file_path}")
         cases.append(TestCase(
             prompt=str(raw["prompt"]),
             target=str(raw.get("target")) if raw.get("target") is not None else None,
             name=str(raw.get("name")) if raw.get("name") is not None else None,
         ))
+    return cases
+
+
+def _maybe_load_cases(path: Optional[str]) -> List[TestCase]:
+    if not path:
+        return [TestCase(**c) for c in DEFAULT_CASES]
+
+    files = _expand_case_files(path)
+    if not files:
+        print(f"[warn] no cases matched spec {path!r}, falling back to built-in defaults.")
+        return [TestCase(**c) for c in DEFAULT_CASES]
+
+    cases: List[TestCase] = []
+    for file_path in files:
+        cases.extend(_load_cases_file(file_path))
     return cases
 
 
@@ -356,8 +394,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument(
         "--cases",
         type=str,
-        default="cases/wiki_basics.yaml",
-        help="Path to JSON/YAML file with test cases (default: cases/wiki_basics.yaml).",
+        default="cases/*.yaml",
+        help=(
+            "Cases file spec: JSON/YAML file, glob pattern, directory, or comma-separated list "
+            "(default: cases/*.yaml)."
+        ),
     )
     parser.add_argument(
         "--top-k",

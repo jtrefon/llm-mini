@@ -300,23 +300,39 @@ class WarmupLRCallback(pl.Callback):
         super().__init__()
         self.warmup_steps = max(1, int(warmup_steps))
         self.base_lrs = None
+        self._resume_step: Optional[int] = None
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        try:
+            step = checkpoint.get("global_step", None)
+        except Exception:
+            step = None
+        if step is None:
+            return
+        try:
+            self._resume_step = int(step)
+        except Exception:
+            self._resume_step = None
 
     def on_fit_start(self, trainer, pl_module):
-        if not trainer.optimizers:
-            return
-        opt = trainer.optimizers[0]
-        self.base_lrs = [g.get('lr', 0.0) for g in opt.param_groups]
-        step = getattr(trainer, 'global_step', 0)
-        if step >= self.warmup_steps:
-            for g, base in zip(opt.param_groups, self.base_lrs):
-                g['lr'] = base
-        else:
-            frac = float(step) / float(self.warmup_steps) if self.warmup_steps > 0 else 1.0
-            for g, base in zip(opt.param_groups, self.base_lrs):
-                g['lr'] = base * frac
+        return
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-        if not trainer.optimizers or self.base_lrs is None:
+        if not trainer.optimizers:
+            return
+        if self._resume_step is not None:
+            try:
+                step_now = int(getattr(trainer, "global_step", 0) or 0)
+            except Exception:
+                step_now = 0
+            if step_now < int(self._resume_step):
+                return
+
+        if self.base_lrs is None:
+            opt = trainer.optimizers[0]
+            self.base_lrs = [g.get('lr', 0.0) for g in opt.param_groups]
+
+        if self.base_lrs is None:
             return
         step = trainer.global_step
         if step >= self.warmup_steps:
@@ -627,19 +643,32 @@ def main(config_path='config.yaml'):
         val_check_interval = max(1, steps_per_epoch * grad_accum)
 
     # Callbacks
-    checkpoint_kwargs = dict(
+    # NOTE: periodic checkpoints may be triggered on training-step boundaries
+    # (via every_n_train_steps). At that time validation metrics like `val_loss`
+    # may not exist yet, so avoid using `val_loss` in the filename template.
+    ckpt_every_opt_steps = save_every if save_every > 0 else steps_per_epoch
+    epoch_checkpoint_kwargs = dict(
         dirpath=ckpt_dir,
-        filename='epoch={epoch}-step={step}-val_loss={val_loss:.3f}',
-        save_top_k=1,
-        monitor='val_loss',
-        mode='min',
+        filename='epoch={epoch}-step={step}',
+        save_top_k=-1,
         save_last=True,
         save_on_train_epoch_end=False,
         auto_insert_metric_name=False,
     )
-    if save_every > 0:
-        checkpoint_kwargs["every_n_train_steps"] = max(1, save_every * grad_accum)
-    checkpoint_cb = ModelCheckpoint(**checkpoint_kwargs)
+    if ckpt_every_opt_steps and ckpt_every_opt_steps > 0:
+        epoch_checkpoint_kwargs["every_n_train_steps"] = max(1, int(ckpt_every_opt_steps) * grad_accum)
+    epoch_checkpoint_cb = ModelCheckpoint(**epoch_checkpoint_kwargs)
+
+    best_checkpoint_cb = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename='best',
+        save_top_k=1,
+        monitor='val_loss',
+        mode='min',
+        save_last=False,
+        save_on_train_epoch_end=False,
+        auto_insert_metric_name=False,
+    )
 
     es_cfg = cfg['training'].get('early_stopping', {})
     if es_cfg.get('enabled', True):
@@ -658,7 +687,14 @@ def main(config_path='config.yaml'):
         early_stop_cb = None
 
     lr_schedule = str(cfg["training"].get("lr_schedule", "warmup_cosine")).lower()
-    callbacks = [c for c in [checkpoint_cb, early_stop_cb, metrics_logger_cb] if c is not None]
+
+    # Callback ordering matters: on_validation_end hooks run in list order. For plateau
+    # training we want LR reductions to occur before early-stopping decisions.
+    callbacks: List[pl.Callback] = [
+        epoch_checkpoint_cb,
+        best_checkpoint_cb,
+        metrics_logger_cb,
+    ]
 
     # Optional: plateau scheduler mode (mutates optimizer LR via callback).
     if lr_schedule in {"plateau", "reduce_on_plateau"}:
@@ -674,6 +710,9 @@ def main(config_path='config.yaml'):
         )
         warmup_cb = WarmupLRCallback(warmup_steps_cb)
         callbacks.extend([rop_cb, warmup_cb])
+
+    if early_stop_cb is not None:
+        callbacks.append(early_stop_cb)
 
     trainer = pl.Trainer(
         accelerator=accelerator,

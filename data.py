@@ -304,6 +304,15 @@ def make_dataloaders(
 
     streaming = bool(data_cfg["streaming"])
     accelerator = cfg["hardware"].get("accelerator", "auto")
+    mps_available = bool(
+        getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+    )
+    if accelerator == "auto":
+        accelerator = "cuda" if torch.cuda.is_available() else ("mps" if mps_available else "cpu")
+    elif accelerator == "cuda" and not torch.cuda.is_available():
+        accelerator = "mps" if mps_available else "cpu"
+    elif accelerator == "mps" and not mps_available:
+        accelerator = "cpu"
     num_workers_cfg = int(cfg["hardware"].get("num_workers", 0) or 0)
     train_split = data_cfg["split"]
     val_split = data_cfg.get("val_split", train_split)
@@ -333,6 +342,15 @@ def make_dataloaders(
             except Exception:
                 prefetch_int = 0
             prefetch = prefetch_int if (persistent and prefetch_int > 0) else None
+
+    if streaming and num_workers > 0:
+        import multiprocessing as mp
+
+        if mp.get_start_method(allow_none=True) == "spawn":
+            num_workers = 0
+            pin_memory = False
+            persistent = False
+            prefetch = None
 
     if streaming:
         print("Using streaming IterableDataset to avoid loading full corpus into memory")

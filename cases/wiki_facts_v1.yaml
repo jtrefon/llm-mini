@@ -1,0 +1,417 @@
+- name: Capital of France
+  prompt: "The capital of France is"
+  target: " Paris"
+- name: Capital of Germany
+  prompt: "The capital of Germany is"
+  target: " Berlin"
+- name: Capital of Spain
+  prompt: "The capital of Spain is"
+  target: " Madrid"
+- name: Capital of Portugal
+  prompt: "The capital of Portugal is"
+  target: " Lisbon"
+- name: Capital of Italy
+  prompt: "The capital of Italy is"
+  target: " Rome"
+- name: Capital of Austria
+  prompt: "The capital of Austria is"
+  target: " Vienna"
+- name: Capital of Switzerland
+  prompt: "The capital of Switzerland is"
+  target: " Bern"
+- name: Capital of Netherlands
+  prompt: "The capital of the Netherlands is"
+  target: " Amsterdam"
+- name: Capital of Belgium
+  prompt: "The capital of Belgium is"
+  target: " Brussels"
+- name: Capital of Sweden
+  prompt: "The capital of Sweden is"
+  target: " Stockholm"
+- name: Capital of Norway
+  prompt: "The capital of Norway is"
+  target: " Oslo"
+- name: Capital of Denmark
+  prompt: "The capital of Denmark is"
+  target: " Copenhagen"
+- name: Capital of Finland
+  prompt: "The capital of Finland is"
+  target: " Helsinki"
+- name: Capital of Poland
+  prompt: "The capital of Poland is"
+  target: " Warsaw"
+- name: Capital of Czech Republic
+  prompt: "The capital of the Czech Republic is"
+  target: " Prague"
+- name: Capital of Hungary
+  prompt: "The capital of Hungary is"
+  target: " Budapest"
+- name: Capital of Greece
+  prompt: "The capital of Greece is"
+  target: " Athens"
+- name: Capital of Turkey
+  prompt: "The capital of Turkey is"
+  target: " Ankara"
+- name: Capital of Russia
+  prompt: "The capital of Russia is"
+  target: " Moscow"
+- name: Capital of Ireland
+  prompt: "The capital of Ireland is"
+  target: " Dublin"
+- name: Capital of Iceland
+  prompt: "The capital of Iceland is"
+  target: " Reykjavik"
+- name: Capital of Canada
+  prompt: "The capital of Canada is"
+  target: " Ottawa"
+- name: Capital of United States
+  prompt: "The capital of the United States is"
+  target: " Washington"
+- name: Capital of Mexico
+  prompt: "The capital of Mexico is"
+  target: " Mexico City"
+- name: Capital of Cuba
+  prompt: "The capital of Cuba is"
+  target: " Havana"
+- name: Capital of Brazil
+  prompt: "The capital of Brazil is"
+  target: " Brasilia"
+- name: Capital of Argentina
+  prompt: "The capital of Argentina is"
+  target: " Buenos Aires"
+- name: Capital of Chile
+  prompt: "The capital of Chile is"
+  target: " Santiago"
+- name: Capital of Peru
+  prompt: "The capital of Peru is"
+  target: " Lima"
+- name: Capital of Colombia
+  prompt: "The capital of Colombia is"
+  target: " Bogota"
+- name: Capital of Egypt
+  prompt: "The capital of Egypt is"
+  target: " Cairo"
+- name: Capital of Morocco
+  prompt: "The capital of Morocco is"
+  target: " Rabat"
+- name: Capital of Nigeria
+  prompt: "The capital of Nigeria is"
+  target: " Abuja"
+- name: Capital of Kenya
+  prompt: "The capital of Kenya is"
+  target: " Nairobi"
+- name: Capital of Israel
+  prompt: "The capital of Israel is"
+  target: " Jerusalem"
+- name: Capital of Saudi Arabia
+  prompt: "The capital of Saudi Arabia is"
+  target: " Riyadh"
+- name: Capital of Iran
+  prompt: "The capital of Iran is"
+  target: " Tehran"
+- name: Capital of China
+  prompt: "The capital of China is"
+  target: " Beijing"
+- name: Capital of Japan
+  prompt: "The capital of Japan is"
+  target: " Tokyo"
+- name: Capital of South Korea
+  prompt: "The capital of South Korea is"
+  target: " Seoul"
+- name: Capital of Thailand
+  prompt: "The capital of Thailand is"
+  target: " Bangkok"
+- name: Capital of Vietnam
+  prompt: "The capital of Vietnam is"
+  target: " Hanoi"
+- name: Capital of Indonesia
+  prompt: "The capital of Indonesia is"
+  target: " Jakarta"
+- name: Capital of Australia
+  prompt: "The capital of Australia is"
+  target: " Canberra"
+- name: Capital of New Zealand
+  prompt: "The capital of New Zealand is"
+  target: " Wellington"
+- name: Capital of India
+  prompt: "The capital of India is"
+  target: " New Delhi"
+- name: Capital of Pakistan
+  prompt: "The capital of Pakistan is"
+  target: " Islamabad"
+- name: Capital of Bangladesh
+  prompt: "The capital of Bangladesh is"
+  target: " Dhaka"
+- name: Capital of Sri Lanka
+  prompt: "The capital of Sri Lanka is"
+  target: " Colombo"
+- name: Capital of Singapore
+  prompt: "The capital of Singapore is"
+  target: " Singapore"
+- name: Capital of Malaysia
+  prompt: "The capital of Malaysia is"
+  target: " Kuala Lumpur"
+- name: Capital of Nepal
+  prompt: "The capital of Nepal is"
+  target: " Kathmandu"
+- name: Capital of Afghanistan
+  prompt: "The capital of Afghanistan is"
+  target: " Kabul"
+- name: Capital of United Arab Emirates
+  prompt: "The capital of the United Arab Emirates is"
+  target: " Abu Dhabi"
+- name: Capital of Qatar
+  prompt: "The capital of Qatar is"
+  target: " Doha"
+- name: Capital of Romania
+  prompt: "The capital of Romania is"
+  target: " Bucharest"
+- name: Capital of Bulgaria
+  prompt: "The capital of Bulgaria is"
+  target: " Sofia"
+- name: Capital of Serbia
+  prompt: "The capital of Serbia is"
+  target: " Belgrade"
+- name: Capital of Croatia
+  prompt: "The capital of Croatia is"
+  target: " Zagreb"
+- name: Capital of Slovakia
+  prompt: "The capital of Slovakia is"
+  target: " Bratislava"
+- name: Capital of Estonia
+  prompt: "The capital of Estonia is"
+  target: " Tallinn"
+- name: Country capital paraphrase 1
+  prompt: "Paris is the capital of"
+  target: " France"
+- name: Country capital paraphrase 2
+  prompt: "Berlin is the capital of"
+  target: " Germany"
+- name: Country capital paraphrase 3
+  prompt: "Tokyo is the capital of"
+  target: " Japan"
+- name: Country capital paraphrase 4
+  prompt: "Rome is the capital of"
+  target: " Italy"
+- name: Continent of France
+  prompt: "France is in the continent of"
+  target: " Europe"
+- name: Continent of Egypt
+  prompt: "Egypt is in the continent of"
+  target: " Africa"
+- name: Continent of Japan
+  prompt: "Japan is in the continent of"
+  target: " Asia"
+- name: Continent of Thailand
+  prompt: "Thailand is in the continent of"
+  target: " Asia"
+- name: Continent of Kenya
+  prompt: "Kenya is in the continent of"
+  target: " Africa"
+- name: Continent of Brazil
+  prompt: "Brazil is in the continent of"
+  target: " South America"
+- name: Continent of Canada
+  prompt: "Canada is in the continent of"
+  target: " North America"
+- name: Sahara location
+  prompt: "The Sahara Desert is in"
+  target: " Africa"
+- name: Great Wall location
+  prompt: "The Great Wall is in"
+  target: " China"
+- name: Taj Mahal location
+  prompt: "The Taj Mahal is in"
+  target: " India"
+- name: Pyramids location
+  prompt: "The Pyramids of Giza are in"
+  target: " Egypt"
+- name: Eiffel Tower location
+  prompt: "The Eiffel Tower is in"
+  target: " Paris"
+- name: Colosseum location
+  prompt: "The Colosseum is in"
+  target: " Rome"
+- name: Statue of Liberty location
+  prompt: "The Statue of Liberty is in"
+  target: " New York"
+- name: Great Barrier Reef
+  prompt: "The Great Barrier Reef is off the coast of"
+  target: " Australia"
+- name: Tallest mountain
+  prompt: "The tallest mountain on Earth is"
+  target: " Mount Everest"
+- name: Mount Everest border
+  prompt: "Mount Everest lies on the border of Nepal and"
+  target: " China"
+- name: Moon orbits
+  prompt: "The Moon orbits the"
+  target: " Earth"
+- name: Earth satellite
+  prompt: "Earth's natural satellite is the"
+  target: " Moon"
+- name: Sun is a star
+  prompt: "The Sun is a"
+  target: " star"
+- name: Milky Way type
+  prompt: "The Milky Way is a"
+  target: " galaxy"
+- name: Closest planet
+  prompt: "The planet closest to the Sun is"
+  target: " Mercury"
+- name: Second planet
+  prompt: "The second planet from the Sun is"
+  target: " Venus"
+- name: Third planet
+  prompt: "The third planet from the Sun is"
+  target: " Earth"
+- name: Fourth planet
+  prompt: "The fourth planet from the Sun is"
+  target: " Mars"
+- name: Largest planet
+  prompt: "The largest planet in the Solar System is"
+  target: " Jupiter"
+- name: Saturn rings
+  prompt: "Saturn is famous for its"
+  target: " rings"
+- name: Seventh planet
+  prompt: "The seventh planet from the Sun is"
+  target: " Uranus"
+- name: Eighth planet
+  prompt: "The eighth planet from the Sun is"
+  target: " Neptune"
+- name: Red planet
+  prompt: "The planet known as the Red Planet is"
+  target: " Mars"
+- name: Light-year
+  prompt: "A light-year is a unit of"
+  target: " distance"
+- name: Chemical symbol hydrogen
+  prompt: "The chemical symbol for hydrogen is"
+  target: " H"
+- name: Chemical symbol helium
+  prompt: "The chemical symbol for helium is"
+  target: " He"
+- name: Chemical symbol carbon
+  prompt: "The chemical symbol for carbon is"
+  target: " C"
+- name: Chemical symbol nitrogen
+  prompt: "The chemical symbol for nitrogen is"
+  target: " N"
+- name: Chemical symbol oxygen
+  prompt: "The chemical symbol for oxygen is"
+  target: " O"
+- name: Chemical symbol sodium
+  prompt: "The chemical symbol for sodium is"
+  target: " Na"
+- name: Chemical symbol potassium
+  prompt: "The chemical symbol for potassium is"
+  target: " K"
+- name: Chemical symbol calcium
+  prompt: "The chemical symbol for calcium is"
+  target: " Ca"
+- name: Chemical symbol iron
+  prompt: "The chemical symbol for iron is"
+  target: " Fe"
+- name: Chemical symbol copper
+  prompt: "The chemical symbol for copper is"
+  target: " Cu"
+- name: Chemical symbol silver
+  prompt: "The chemical symbol for silver is"
+  target: " Ag"
+- name: Chemical symbol gold
+  prompt: "The chemical symbol for gold is"
+  target: " Au"
+- name: Chemical symbol lead
+  prompt: "The chemical symbol for lead is"
+  target: " Pb"
+- name: Chemical symbol mercury
+  prompt: "The chemical symbol for mercury is"
+  target: " Hg"
+- name: Chemical symbol tin
+  prompt: "The chemical symbol for tin is"
+  target: " Sn"
+- name: Chemical symbol chlorine
+  prompt: "The chemical symbol for chlorine is"
+  target: " Cl"
+- name: Chemical symbol iodine
+  prompt: "The chemical symbol for iodine is"
+  target: " I"
+- name: Chemical symbol neon
+  prompt: "The chemical symbol for neon is"
+  target: " Ne"
+- name: Chemical symbol silicon
+  prompt: "The chemical symbol for silicon is"
+  target: " Si"
+- name: Chemical symbol phosphorus
+  prompt: "The chemical symbol for phosphorus is"
+  target: " P"
+- name: Chemical symbol sulfur
+  prompt: "The chemical symbol for sulfur is"
+  target: " S"
+- name: Chemical symbol zinc
+  prompt: "The chemical symbol for zinc is"
+  target: " Zn"
+- name: Water formula
+  prompt: "The chemical formula for water is"
+  target: " H2O"
+- name: Carbon dioxide formula
+  prompt: "The chemical formula for carbon dioxide is"
+  target: " CO2"
+- name: Salt formula
+  prompt: "The chemical formula for table salt is"
+  target: " NaCl"
+- name: Water pH
+  prompt: "The pH of pure water is about"
+  target: " 7"
+- name: Photosynthesis definition
+  prompt: "The process by which plants make food using sunlight is"
+  target: " photosynthesis"
+- name: Genetic molecule
+  prompt: "The molecule that carries genetic information is"
+  target: " DNA"
+- name: Basic unit of life
+  prompt: "The basic unit of life is the"
+  target: " cell"
+- name: Heart pumps
+  prompt: "The heart pumps"
+  target: " blood"
+- name: Largest human organ
+  prompt: "The largest organ in the human body is the"
+  target: " skin"
+- name: Spider legs
+  prompt: "A spider has"
+  target: " eight"
+- name: Human bones
+  prompt: "Adult humans have"
+  target: " 206"
+- name: World War II end year
+  prompt: "World War II ended in"
+  target: " 1945"
+- name: Roman Empire center
+  prompt: "The Roman Empire was centered in"
+  target: " Rome"
+- name: Renaissance origin
+  prompt: "The Renaissance began in"
+  target: " Italy"
+- name: First US president
+  prompt: "The first president of the United States was"
+  target: " George Washington"
+- name: First man on the Moon
+  prompt: "The first man on the Moon was"
+  target: " Neil Armstrong"
+- name: United Nations HQ
+  prompt: "The United Nations is headquartered in"
+  target: " New York"
+- name: Hamlet author
+  prompt: "Hamlet was written by"
+  target: " Shakespeare"
+- name: Mona Lisa painter
+  prompt: "The Mona Lisa was painted by"
+  target: " Leonardo da Vinci"
+- name: Japan currency
+  prompt: "The currency of Japan is the"
+  target: " yen"
+- name: United States currency
+  prompt: "The currency of the United States is the"
+  target: " dollar"
