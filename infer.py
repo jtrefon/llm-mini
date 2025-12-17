@@ -1,4 +1,5 @@
 import argparse
+import warnings
 import torch
 from transformers import AutoTokenizer
 from model import GPTMini, GPTConfig
@@ -7,7 +8,9 @@ import pytorch_lightning as pl
 
 def load_from_lightning_ckpt(ckpt_path: str, tokenizer_name: str, device: str = 'mps'):
     # Rebuild config from tokenizer + hyperparams saved in Lightning checkpoint
-    ckpt = torch.load(ckpt_path, map_location='cpu')
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=FutureWarning)
+        ckpt = torch.load(ckpt_path, map_location='cpu')
     hparams = ckpt.get('hyper_parameters', {})
 
     # Prefer tokenizer from checkpoint hparams if requested
