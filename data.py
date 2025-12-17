@@ -382,15 +382,22 @@ def make_dataloaders(
             download_mode="reuse_cache_if_exists",
         )
 
+        shuffle_buffer = int(data_cfg.get("shuffle_buffer", 512) or 512)
+        shuffle_seed = int(cfg.get("training", {}).get("seed", 42) or 42)
+        shuffle_train = bool(data_cfg.get("shuffle_train", True))
+        shuffle_val = bool(data_cfg.get("shuffle_val", False))
+
         # Shuffle streams (bounded buffer) in the main process so workers only iterate.
-        try:
-            ds_train = ds_train.shuffle(buffer_size=512, seed=42)
-        except TypeError:
-            ds_train = ds_train.shuffle(512, seed=42)
-        try:
-            ds_val = ds_val.shuffle(buffer_size=512, seed=42)
-        except TypeError:
-            ds_val = ds_val.shuffle(512, seed=42)
+        if shuffle_train:
+            try:
+                ds_train = ds_train.shuffle(buffer_size=shuffle_buffer, seed=shuffle_seed)
+            except TypeError:
+                ds_train = ds_train.shuffle(shuffle_buffer, seed=shuffle_seed)
+        if shuffle_val:
+            try:
+                ds_val = ds_val.shuffle(buffer_size=shuffle_buffer, seed=shuffle_seed)
+            except TypeError:
+                ds_val = ds_val.shuffle(shuffle_buffer, seed=shuffle_seed)
 
         text_field = cfg["data"]["text_field"]
 
