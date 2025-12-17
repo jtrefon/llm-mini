@@ -430,6 +430,56 @@ class ResetLROnResumeCallback(pl.Callback):
         self._done = True
 
 
+class WarmupCosineOnResumeCallback(pl.Callback):
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__()
+        self._cfg = cfg
+        self._resume_step: Optional[int] = None
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        try:
+            step = checkpoint.get("global_step", None)
+        except Exception:
+            step = None
+        if step is None:
+            return
+        try:
+            self._resume_step = int(step)
+        except Exception:
+            self._resume_step = None
+
+    def _apply(self, trainer) -> None:
+        if self._resume_step is None:
+            return
+        try:
+            step_now = int(getattr(trainer, "global_step", 0) or 0)
+        except Exception:
+            step_now = 0
+        if step_now < int(self._resume_step):
+            return
+
+        tcfg = self._cfg.get("training", {})
+        base_lr = float(tcfg.get("lr", 0.0) or 0.0)
+        warmup_ratio = float(tcfg.get("warmup_ratio", 0.0) or 0.0)
+        max_steps = int(tcfg.get("max_steps", 0) or 0)
+        min_lr_ratio = float(tcfg.get("min_lr_ratio", 0.0) or 0.0)
+        if base_lr <= 0.0 or max_steps <= 0:
+            return
+        if not trainer.optimizers:
+            return
+        mult = WarmupCosine(warmup_ratio, max_steps, min_lr_ratio=min_lr_ratio)(step_now)
+        lr = float(base_lr) * float(mult)
+        opt = trainer.optimizers[0]
+        for pg in opt.param_groups:
+            pg["lr"] = lr
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        self._apply(trainer)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self._apply(trainer)
+
+
 def find_latest_checkpoint(config_ckpt_dir: str = 'checkpoints') -> Optional[str]:
     """Find the most advanced checkpoint by filename step parsing."""
     patterns = [
@@ -820,6 +870,8 @@ def main(config_path='config.yaml'):
     ]
 
     if bool(cfg.get("training", {}).get("reset_lr_on_resume", False)):
+        if lr_schedule in {"warmup_cosine", "cosine"}:
+            callbacks.insert(0, WarmupCosineOnResumeCallback(cfg))
         callbacks.insert(0, ResetLROnResumeCallback(cfg))
 
     # Optional: plateau scheduler mode (mutates optimizer LR via callback).
