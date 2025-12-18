@@ -1,4 +1,5 @@
 # finetune.py
+import argparse
 import os, glob, math, yaml, shutil
 from typing import Dict, List, Optional
 
@@ -262,7 +263,7 @@ class EarlyStoppingWithWarmup(pl.callbacks.early_stopping.EarlyStopping):
 # =========================
 # Main
 # =========================
-def main(config_path="config.yaml"):
+def main(config_path: str = "config_finetune.yaml"):
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -298,6 +299,7 @@ def main(config_path="config.yaml"):
         rope_theta=cfg["model"]["rope_theta"],
         tie_embeddings=cfg["model"]["tie_embeddings"],
         swa_window=cfg["model"]["swa_window"],
+        gradient_checkpointing=bool(cfg["model"].get("gradient_checkpointing", False)),
     )
     lit = LitSFT(cfg, tok)
     lit.net = GPTMini(mcfg)  # ensure module matches mcfg
@@ -467,4 +469,7 @@ def main(config_path="config.yaml"):
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="config_finetune.yaml")
+    args = parser.parse_args()
+    main(args.config)
