@@ -225,7 +225,7 @@ class ReduceLROnPlateauOnVal(pl.Callback):
         if self.cool > 0:
             self.cool -= 1
             return
-        if self.bad > self.patience:
+        if self.bad >= self.patience:
             opt = trainer.optimizers[0]
             for pg in opt.param_groups:
                 pg["lr"] = max(self.min_lr, pg["lr"] * self.factor)
@@ -233,6 +233,12 @@ class ReduceLROnPlateauOnVal(pl.Callback):
             try:
                 new_lr = opt.param_groups[0]["lr"]
                 print(f"[SFT] LR reduced to {new_lr:.6g}")
+            except Exception:
+                pass
+            try:
+                for cb in trainer.callbacks:
+                    if isinstance(cb, pl.callbacks.early_stopping.EarlyStopping):
+                        cb.wait_count = 0
             except Exception:
                 pass
             self.bad = 0; self.cool = self.cooldown
@@ -266,6 +272,8 @@ class EarlyStoppingWithWarmup(pl.callbacks.early_stopping.EarlyStopping):
 def main(config_path: str = "config_finetune.yaml"):
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
+
+    print(f"[SFT] Loading config: {config_path}")
 
     pl.seed_everything(cfg["training"]["seed"])
 
@@ -392,6 +400,13 @@ def main(config_path: str = "config_finetune.yaml"):
         )
     rop_cfg = cfg["training"].get("reduce_on_plateau", {"factor":0.5,"patience":2,"min_lr":1e-6,"cooldown":0,"threshold":0.0})
     warmup_steps = int(cfg["training"].get("warmup_ratio", 0.03) * max_steps)
+
+    print(
+        "[SFT] "
+        f"max_steps={max_steps} lr={base_lr:.6g} warmup_steps={warmup_steps} "
+        f"es(patience={es_patience}, min_delta={es_min_delta}, warmup_fraction={es_warm_frac}) "
+        f"rop(patience={rop_cfg.get('patience', 2)}, factor={rop_cfg.get('factor', 0.5)}, threshold={rop_cfg.get('threshold', 0.0)})"
+    )
     rop_cb  = ReduceLROnPlateauOnVal(
         patience=rop_cfg.get("patience", 2),
         factor=  rop_cfg.get("factor", 0.5),
@@ -417,7 +432,7 @@ def main(config_path: str = "config_finetune.yaml"):
         WarmupLRCallback(warmup_steps),
     ]
     if es_cb is not None:
-        callbacks_list.insert(1, es_cb)
+        callbacks_list.insert(2, es_cb)
 
     # Limit per-epoch batches to enforce the above epoch definition. If not provided,
     # fall back to Lightning defaults or user override.

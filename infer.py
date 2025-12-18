@@ -6,11 +6,34 @@ from model import GPTMini, GPTConfig
 import pytorch_lightning as pl
 
 
-def load_from_lightning_ckpt(ckpt_path: str, tokenizer_name: str, device: str = 'mps'):
+def load_from_lightning_ckpt(
+    ckpt_path: str,
+    tokenizer_name: str,
+    device: str = 'mps',
+    print_ckpt_info: bool = False,
+):
     # Rebuild config from tokenizer + hyperparams saved in Lightning checkpoint
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=FutureWarning)
         ckpt = torch.load(ckpt_path, map_location='cpu')
+    if print_ckpt_info:
+        try:
+            hparams0 = ckpt.get('hyper_parameters', {})
+            training0 = hparams0.get('training', {}) if isinstance(hparams0, dict) else {}
+            model0 = hparams0.get('model', {}) if isinstance(hparams0, dict) else {}
+            print(
+                "[infer] ckpt_info "
+                f"global_step={ckpt.get('global_step', None)} "
+                f"epoch={ckpt.get('epoch', None)} "
+                f"lr={training0.get('lr', None)} "
+                f"max_steps={training0.get('max_steps', None)} "
+                f"warmup_ratio={training0.get('warmup_ratio', None)} "
+                f"ckpt_dir={training0.get('ckpt_dir', None)} "
+                f"dropout={model0.get('dropout', None)}"
+            )
+        except Exception as e:
+            print(f"[infer] ckpt_info unavailable: {e}")
+
     hparams = ckpt.get('hyper_parameters', {})
 
     # Prefer tokenizer from checkpoint hparams if requested
@@ -152,6 +175,8 @@ if __name__ == '__main__':
     parser.add_argument('--no_repeat_ngram_size', type=int, default=3, help='Prevent repeating any n-gram of this size (0 to disable).')
     parser.add_argument('--beam_width', type=int, default=1, help='Beam search width (1 for greedy)')
     parser.add_argument('--compute_ppl', action='store_true', help='Compute perplexity on generated text')
+    parser.add_argument('--print_ckpt_info', action='store_true', help='Print checkpoint provenance (global_step/epoch and key saved hparams).')
+    parser.add_argument('--info_only', action='store_true', help='Exit after printing checkpoint info (no generation).')
     parser.add_argument('--seed', type=int, default=None)
     args = parser.parse_args()
 
@@ -168,7 +193,14 @@ if __name__ == '__main__':
                 user = args.prompt.strip()
                 args.prompt = f"### Instruction:\n{user}\n\n### Response:\n"
 
-    model, tok, dev = load_from_lightning_ckpt(args.ckpt, tokenizer_name=args.tokenizer, device=args.device)
+    model, tok, dev = load_from_lightning_ckpt(
+        args.ckpt,
+        tokenizer_name=args.tokenizer,
+        device=args.device,
+        print_ckpt_info=bool(args.print_ckpt_info),
+    )
+    if args.info_only:
+        raise SystemExit(0)
     if args.disable_eos:
         try:
             tok.eos_token_id = None
