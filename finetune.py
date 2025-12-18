@@ -378,7 +378,7 @@ def main(config_path: str = "config_finetune.yaml"):
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_cb = ModelCheckpoint(
         dirpath=ckpt_dir, filename="sft-best",
-        monitor="val_loss", mode="min", save_top_k=1, save_last=True,
+        monitor="val_loss", mode="min", save_top_k=1, save_last="sft-last",
         auto_insert_metric_name=False,
     )
     es_cfg  = cfg["training"].get("early_stopping", {"enabled": True, "patience": 9, "min_delta": 0.001})

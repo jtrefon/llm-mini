@@ -24,7 +24,7 @@ training:
   warmup_ratio: 0.005
   precision: "bf16-mixed"
   steps_per_epoch: 100
-  ckpt_dir: "checkpoints_sft_v2"
+  ckpt_dir: "checkpoints"
   base_ckpt_path: "checkpoints/final.ckpt"
 
   reduce_on_plateau:
