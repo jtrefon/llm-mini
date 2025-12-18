@@ -442,7 +442,11 @@ def make_dataloaders(
 
         # Validation stream: separate loader; for simplicity use a separate dataset read
         print("Preparing validation streaming dataset...")
-        skip_for_val = train_docs if (val_split == train_split and train_docs is not None) else 0
+        val_skip_docs = _get_optional_positive_int(data_cfg, "val_skip_docs", None)
+        if val_skip_docs is not None:
+            skip_for_val = val_skip_docs
+        else:
+            skip_for_val = train_docs if (val_split == train_split and train_docs is not None) else 0
         val_docs = _get_optional_positive_int(data_cfg, "val_docs", 100000)
         val_ds = StreamingPackedLMDataset(
             make_stream_factory(ds_val, skip_docs=skip_for_val),

@@ -1,9 +1,9 @@
 model:
-  n_layers: 16            # Number of layers in the model architecture
+  n_layers: 22            # Number of layers in the model architecture
   d_model: 768            # Model dimension
   n_heads: 12             # Number of attention heads
-  n_kv_heads: 2           # GQA: KV heads < Q heads
-  d_ff: 3072              # ~4x d_model, SwiGLU inside will split
+  n_kv_heads: 4           # GQA: KV heads < Q heads
+  d_ff: 2048              # ~4x d_model, SwiGLU inside will split
   dropout: 0.0            # Dropping out tokens to prevent overfitting, specify percentage (0.0 to disable)
   vocab_size: null        # filled from tokenizer
   rope_theta: 1000000     # RoPE base; larger supports longer context
@@ -20,15 +20,21 @@ training:
   save_every: 100         # Save every X steps
   lr_schedule: "warmup_cosine"  # "warmup_cosine" (recommended) or "plateau"
   lr: 3.0e-4              # tuned lower for stability with ~64 sequence effective batch
+  min_lr_ratio: 0.1       # LR floor as a fraction of base lr (used by warmup_cosine)
   weight_decay: 0.1       # it's a regularization term that prevents overfitting, 0.1 is default
   betas: [0.9, 0.95]      # it's a hyperparameter which scale and shift normalized input
   eps: 1.0e-8             # it's a hyperparameter which prevents division by zero
   warmup_ratio: 0.02      # it's a hyperparameter which controls the amount of warmup steps
-  precision: "32"        # it's a hyperparameter which controls the precision of the optimizer
+  precision: "bf16-mixed"        # it's a hyperparameter which controls the precision of the optimizer
+  fused_adamw: true
   seed: 42                # it's a hyperparameter which controls the random seed
   steps_per_epoch: 100    # align epoch length with desired validation cadence
   # Optional: set to a pretrained checkpoint to initialize SFT from
   base_ckpt_path: null    # e.g., "checkpoints/final.ckpt" or leave null to skip
+
+  # Resume behavior
+  auto_resume: true
+  reset_lr_on_resume: true  # crucial if max_steps changes or to fix scheduler state on resume
 
   # Learning-rate reduction on plateau (val_loss)
   reduce_on_plateau:
@@ -40,7 +46,7 @@ training:
 
   # Early stopping on validation loss
   early_stopping:
-    enabled: true         # Set false to disable early stopping entirely
+    enabled: false         # Set false to disable early stopping entirely
     patience: 9           # Number of validations with no improvement before stop
     min_delta: 0.001      # Minimum improvement (absolute) to qualify as progress
     warmup_fraction: 0.3  # Ignore early-stopping decisions in initial 30% of steps
@@ -61,6 +67,7 @@ data:
   max_shards: 100        # optional: limit shards/rows for quick smoke tests
   pack_sequences: true    # concatenate tokens and pack into fixed-length blocks
   max_doc_len: 0         # per-document tokenization cap (larger captures more long-form structure)
+  shuffle_buffer: 10000
 
   # Dataset size configuration
   train_docs: 0          # 0 or null = unlimited documents

@@ -269,7 +269,7 @@ class EarlyStoppingWithWarmup(pl.callbacks.early_stopping.EarlyStopping):
 # =========================
 # Main
 # =========================
-def main(config_path: str = "config_finetune.yaml"):
+def main(config_path: str = "config_finetune.yaml", dry_run: bool = False):
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -407,6 +407,11 @@ def main(config_path: str = "config_finetune.yaml"):
         f"es(patience={es_patience}, min_delta={es_min_delta}, warmup_fraction={es_warm_frac}) "
         f"rop(patience={rop_cfg.get('patience', 2)}, factor={rop_cfg.get('factor', 0.5)}, threshold={rop_cfg.get('threshold', 0.0)})"
     )
+
+    if dry_run:
+        print("[SFT] Dry run requested. Exiting after config load.")
+        return
+
     rop_cb  = ReduceLROnPlateauOnVal(
         patience=rop_cfg.get("patience", 2),
         factor=  rop_cfg.get("factor", 0.5),
@@ -486,5 +491,6 @@ def main(config_path: str = "config_finetune.yaml"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config_finetune.yaml")
+    parser.add_argument("--dry-run", action="store_true", help="Print config and exit")
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, args.dry_run)
