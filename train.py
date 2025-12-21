@@ -728,6 +728,12 @@ def main(config_path='config.yaml'):
     warnings.filterwarnings("ignore", message="You're resuming from a checkpoint that ended before the epoch ended")
     pl.seed_everything(cfg['training']['seed'])
 
+    # ENFORCE OFFLINE MODE if configured, to prevent accidental network calls/bans
+    if cfg.get("data", {}).get("offline", False):
+        print("[Config] Offline mode enabled: enforcing HF_DATASETS_OFFLINE=1 and HF_HUB_OFFLINE=1")
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+
     os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     try:

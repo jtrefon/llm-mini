@@ -58,6 +58,7 @@ hardware:
 
 # Dataset options. Start with a preprocessed, manageable corpus.
 data:
+  offline: true           # Enforce offline mode to prevent network requests (timeout/ban safety)
   dataset: "wikimedia/wikipedia"
   split: "train"
   val_split: "train"      # set to a separate split (e.g. "validation") when available

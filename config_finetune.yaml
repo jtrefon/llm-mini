@@ -16,18 +16,22 @@ training:
   seq_len: 1024
   micro_batch_size: 7
   grad_accum_steps: 8
-  max_steps: 20000
-  lr: 5.0e-5
-  weight_decay: 0.01
+  max_epochs: 50
+  max_steps: 0
+  lr: 2.0e-5
+  lr_schedule: "warmup_cosine"
+  min_lr_ratio: 0.1
+  weight_decay: 0.0
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  warmup_ratio: 0.005
+  warmup_ratio: 0.03
   precision: "bf16-mixed"
-  steps_per_epoch: 100
+  steps_per_epoch: 0
   ckpt_dir: "checkpoints"
   base_ckpt_path: "checkpoints/final.ckpt"
 
   reduce_on_plateau:
+    enabled: false
     factor: 0.5
     patience: 4
     threshold: 0.0005
@@ -35,7 +39,7 @@ training:
     min_lr: 1.0e-6
 
   early_stopping:
-    enabled: true
+    enabled: false
     patience: 8
     min_delta: 0.0005
     warmup_fraction: 0.2
@@ -46,8 +50,9 @@ hardware:
   num_workers: 4
 
 data:
+  offline: true
   dataset: "tatsu-lab/alpaca"
   split: "train"
   tokenizer_name: "gpt2"
   train_docs: 0
-  val_docs: 1000
+  val_docs: 2000

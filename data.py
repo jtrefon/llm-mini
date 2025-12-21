@@ -204,6 +204,9 @@ def load_text_dataset(
     import os
 
     offline_env = os.getenv("HF_OFFLINE_MODE", "0").lower() in ("1", "true", "yes")
+    # Respect standard HF offline environment variables as well
+    if os.environ.get("HF_DATASETS_OFFLINE") == "1" or os.environ.get("HF_HUB_OFFLINE") == "1":
+        offline_env = True
     offline = bool(offline_mode or offline_env)
 
     # When offline, avoid *any* network calls. If the dataset isn't cached, this will error early.
@@ -362,6 +365,9 @@ def make_dataloaders(
         import os
 
         offline_env = os.getenv("HF_OFFLINE_MODE", "0").lower() in ("1", "true", "yes")
+        # Respect standard HF offline environment variables as well
+        if os.environ.get("HF_DATASETS_OFFLINE") == "1" or os.environ.get("HF_HUB_OFFLINE") == "1":
+            offline_env = True
         offline_cfg = bool(data_cfg.get("offline", False) or offline_env)
         download_config = DownloadConfig(local_files_only=True) if offline_cfg else None
 
@@ -551,9 +557,18 @@ def make_dataloaders(
 def get_tokenizer(cfg: Dict[str, Any]):
     """Loads and configures the tokenizer."""
     from transformers import AutoTokenizer
+    import os
 
-    tok_name = cfg["data"]["tokenizer_name"]
-    tok = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
+    data_cfg = cfg["data"]
+    tok_name = data_cfg["tokenizer_name"]
+    
+    # Check offline mode
+    offline_env = os.getenv("HF_OFFLINE_MODE", "0").lower() in ("1", "true", "yes")
+    if os.environ.get("HF_DATASETS_OFFLINE") == "1" or os.environ.get("HF_HUB_OFFLINE") == "1":
+        offline_env = True
+    offline = bool(data_cfg.get("offline", False) or offline_env)
+
+    tok = AutoTokenizer.from_pretrained(tok_name, use_fast=True, local_files_only=offline)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token if tok.eos_token is not None else tok.unk_token
     try:

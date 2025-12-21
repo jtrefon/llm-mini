@@ -14,7 +14,6 @@ from transformers import AutoTokenizer
 from model import GPTMini, GPTConfig
 from train import (
     LitCausalLM,
-    WarmupLRCallback,
 )  # reuse your existing LightningModule & checkpoint utilities
 
 class LitSFT(LitCausalLM):
@@ -28,12 +27,11 @@ class LitSFT(LitCausalLM):
         self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
         ppl = torch.exp(loss)
         self.log('val_ppl', ppl, prog_bar=True, on_step=False, on_epoch=True)
+        
         # Instruction-specific metric: accuracy on non-ignored labels
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        pred = shift_logits.argmax(dim=-1)
-        mask = shift_labels != -100
-        acc = (pred == shift_labels)[mask].float().mean()
+        pred = logits.argmax(dim=-1)
+        mask = labels != -100
+        acc = (pred == labels)[mask].float().mean()
         self.log('val_acc', acc, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
@@ -143,14 +141,29 @@ class CollateSFT:
 
 
 def make_alpaca_loaders(tokenizer: AutoTokenizer, seq_len: int, micro_batch_size: int,
-                         train_limit: Optional[int] = None, val_limit: int = 1000, num_workers: int = 0):
-    ds = load_dataset("tatsu-lab/alpaca", split="train")
+                         train_limit: Optional[int] = None, val_limit: int = 1000, num_workers: int = 0,
+                         offline: bool = False, seed: int = 42):
+    from datasets import load_dataset, DownloadConfig
+    
+    download_config = DownloadConfig(local_files_only=True) if offline else None
+    ds = load_dataset(
+        "tatsu-lab/alpaca", 
+        split="train",
+        download_config=download_config
+    )
     # drop empties
     ds = ds.filter(lambda ex: isinstance(ex.get("output", None), str) and len(ex["output"].strip()) > 0)
     if train_limit:
         ds = ds.select(range(min(train_limit, len(ds))))
+
+    try:
+        ds = ds.shuffle(seed=int(seed))
+    except Exception:
+        pass
+
     # carve a small val set from the tail (disjoint)
-    val_n = min(val_limit, max(500, len(ds)//10))
+    val_n = min(int(val_limit), max(500, len(ds) // 10))
+    val_n = min(val_n, max(1, len(ds) - 1))
     val_start = max(0, len(ds) - val_n)
     ds_train = ds.select(range(0, val_start))
     ds_val   = ds.select(range(val_start, len(ds)))
@@ -264,9 +277,6 @@ class EarlyStoppingWithWarmup(pl.callbacks.early_stopping.EarlyStopping):
 
 
 # Removed StableCheckpointCopies; rely on a single ModelCheckpoint with save_last=True
-
-
-# =========================
 # Main
 # =========================
 def main(config_path: str = "config_finetune.yaml", dry_run: bool = False):
@@ -275,10 +285,21 @@ def main(config_path: str = "config_finetune.yaml", dry_run: bool = False):
 
     print(f"[SFT] Loading config: {config_path}")
 
+    # ENFORCE OFFLINE MODE if configured
+    if cfg.get("data", {}).get("offline", False):
+        print("[SFT] Offline mode enabled: enforcing HF_DATASETS_OFFLINE=1 and HF_HUB_OFFLINE=1")
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+
     pl.seed_everything(cfg["training"]["seed"])
 
     # Tokenizer
-    tok = AutoTokenizer.from_pretrained(cfg["data"]["tokenizer_name"], use_fast=True)
+    offline_mode = bool(cfg.get("data", {}).get("offline", False))
+    tok = AutoTokenizer.from_pretrained(
+        cfg["data"]["tokenizer_name"], 
+        use_fast=True,
+        local_files_only=offline_mode
+    )
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token or tok.unk_token
     # Silence HF long-sequence warnings; we handle truncation later
@@ -293,7 +314,45 @@ def main(config_path: str = "config_finetune.yaml", dry_run: bool = False):
     nw = cfg["hardware"]["num_workers"]
     train_limit = cfg["data"].get("train_docs", None)
     val_limit   = cfg["data"].get("val_docs", 1000)
-    train_loader, val_loader = make_alpaca_loaders(tok, seq_len, mb, train_limit, val_limit, nw)
+    train_loader, val_loader = make_alpaca_loaders(
+        tok, seq_len, mb, train_limit, val_limit, nw,
+        offline=offline_mode,
+        seed=int(cfg["training"].get("seed", 42) or 42),
+    )
+
+    # Resolve training length early so the LightningModule scheduler sees correct max_steps.
+    grad_accum_steps = int(cfg["training"].get("grad_accum_steps", 1) or 1)
+    try:
+        train_batches_per_epoch = len(train_loader)
+    except Exception:
+        train_batches_per_epoch = 0
+    steps_per_epoch_inferred = (
+        int(math.ceil(train_batches_per_epoch / float(max(1, grad_accum_steps))))
+        if train_batches_per_epoch
+        else 0
+    )
+
+    cfg_steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 0) or 0)
+    steps_per_epoch = steps_per_epoch_inferred if steps_per_epoch_inferred > 0 else cfg_steps_per_epoch
+
+    max_epochs_cfg = cfg["training"].get("max_epochs", None)
+    max_steps_cfg = int(cfg["training"].get("max_steps", 0) or 0)
+    if max_epochs_cfg is not None:
+        max_epochs = int(max_epochs_cfg)
+        if steps_per_epoch <= 0:
+            raise ValueError("[SFT] Unable to infer steps_per_epoch; please set training.steps_per_epoch")
+        max_steps = int(max_epochs * steps_per_epoch)
+    else:
+        max_steps = max_steps_cfg if max_steps_cfg > 0 else 1000
+        if steps_per_epoch > 0:
+            max_epochs = int(math.ceil(max_steps / float(steps_per_epoch)))
+        else:
+            max_epochs = 10
+
+    cfg.setdefault("training", {})
+    cfg["training"]["max_steps"] = int(max_steps)
+    if steps_per_epoch > 0:
+        cfg["training"]["steps_per_epoch"] = int(steps_per_epoch)
 
     # Model (reuse your config dims)
     mcfg = GPTConfig(
@@ -341,36 +400,9 @@ def main(config_path: str = "config_finetune.yaml", dry_run: bool = False):
     if not ok:
         raise RuntimeError(f"[SFT] Failed to load base weights from {base_ckpt}")
 
-    # Optimizer & schedule: gentle for SFT
-    base_lr = float(cfg["training"].get("lr", 1e-5))
-    cfg["training"]["lr"] = base_lr  # reflect in hparams
-    # Parameter groups: apply weight decay to weights (ndim>=2), not to biases/norms
-    wd = float(cfg["training"]["weight_decay"])
-    betas = tuple(float(x) for x in cfg["training"]["betas"])
-    eps = float(cfg["training"]["eps"])
-    decay_params = []
-    nodecay_params = []
-    for n, p in lit.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.ndim >= 2:
-            decay_params.append(p)
-        else:
-            nodecay_params.append(p)
-    optimizer = torch.optim.AdamW([
-        {"params": decay_params, "weight_decay": wd},
-        {"params": nodecay_params, "weight_decay": 0.0},
-    ], lr=base_lr, betas=betas, eps=eps)
-
-    # Unify scheduling: Warmup to base LR, then rely on Reduce-On-Plateau
-    # Do not attach a per-step LambdaLR to avoid overwriting plateau adjustments
-    lit.configure_optimizers = lambda: {"optimizer": optimizer}
-
     # Hardware
     accelerator = cfg["hardware"]["accelerator"]
     devices = cfg["hardware"]["devices"]
-    # Total training steps (used by ES warmup and validation cadence)
-    max_steps = int(cfg["training"].get("max_steps", 1000))
 
     # Callbacks
     from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
@@ -398,67 +430,42 @@ def main(config_path: str = "config_finetune.yaml", dry_run: bool = False):
             min_steps=es_min_steps,
             check_on_train_epoch_end=False,
         )
-    rop_cfg = cfg["training"].get("reduce_on_plateau", {"factor":0.5,"patience":2,"min_lr":1e-6,"cooldown":0,"threshold":0.0})
+    rop_cfg = cfg["training"].get("reduce_on_plateau", {})
+    rop_enabled = bool(rop_cfg.get("enabled", False))
     warmup_steps = int(cfg["training"].get("warmup_ratio", 0.03) * max_steps)
 
     print(
         "[SFT] "
-        f"max_steps={max_steps} lr={base_lr:.6g} warmup_steps={warmup_steps} "
+        f"max_steps={max_steps} warmup_steps={warmup_steps} steps_per_epoch={steps_per_epoch} max_epochs={max_epochs} "
         f"es(patience={es_patience}, min_delta={es_min_delta}, warmup_fraction={es_warm_frac}) "
-        f"rop(patience={rop_cfg.get('patience', 2)}, factor={rop_cfg.get('factor', 0.5)}, threshold={rop_cfg.get('threshold', 0.0)})"
+        f"rop(enabled={rop_enabled})"
     )
 
     if dry_run:
         print("[SFT] Dry run requested. Exiting after config load.")
         return
 
-    rop_cb  = ReduceLROnPlateauOnVal(
-        patience=rop_cfg.get("patience", 2),
-        factor=  rop_cfg.get("factor", 0.5),
-        min_lr=  rop_cfg.get("min_lr", 1e-6),
-        cooldown=rop_cfg.get("cooldown", 0),
-        threshold=rop_cfg.get("threshold", 0.0),
-        monitor="val_loss", mode="min", warmup_steps=warmup_steps
-    )
+    rop_cb = None
+    if rop_enabled:
+        rop_cb  = ReduceLROnPlateauOnVal(
+            patience=rop_cfg.get("patience", 10),
+            factor=  rop_cfg.get("factor", 0.8),
+            min_lr=  rop_cfg.get("min_lr", 1e-6),
+            cooldown=rop_cfg.get("cooldown", 0),
+            threshold=rop_cfg.get("threshold", 0.0),
+            monitor="val_loss", mode="min", warmup_steps=warmup_steps,
+        )
     lr_mon  = LearningRateMonitor(logging_interval="epoch")
 
     # Trainer settings
-    # Align validation and snapshot saving with the end of each epoch ("epic end").
-    # Define an epoch by optimizer steps using steps_per_epoch and grad_accum_steps.
-    steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 0) or 0)
-    grad_accum_steps = int(cfg["training"].get("grad_accum_steps", 1))
-    # Number of training batches (forward passes) per epoch
-    batches_per_epoch = steps_per_epoch * max(1, grad_accum_steps) if steps_per_epoch > 0 else None
-
     callbacks_list = [
         ckpt_cb,
-        rop_cb,
         lr_mon,
-        WarmupLRCallback(warmup_steps),
     ]
+    if rop_cb is not None:
+        callbacks_list.insert(1, rop_cb)
     if es_cb is not None:
         callbacks_list.insert(2, es_cb)
-
-    # Limit per-epoch batches to enforce the above epoch definition. If not provided,
-    # fall back to Lightning defaults or user override.
-    limit_batches_cfg = cfg["training"].get("limit_train_batches", None)
-    if batches_per_epoch is not None and batches_per_epoch > 0 and limit_batches_cfg is None:
-        limit_train_batches = batches_per_epoch
-    else:
-        limit_train_batches = limit_batches_cfg if limit_batches_cfg is not None else 1.0
-
-    # Compute max_epochs from desired total optimizer steps. This ensures validation happens
-    # exactly at the end of each logical epoch.
-    if steps_per_epoch and steps_per_epoch > 0:
-        max_epochs = int(math.ceil(max_steps / float(steps_per_epoch)))
-    else:
-        # Fallback: approximate 10 epochs across training if steps_per_epoch not set
-        approx_epochs = 10
-        steps_per_epoch = max(1, max_steps // approx_epochs)
-        batches_per_epoch = steps_per_epoch * max(1, grad_accum_steps)
-        if limit_batches_cfg is None:
-            limit_train_batches = batches_per_epoch
-        max_epochs = approx_epochs
 
     os.makedirs("logs", exist_ok=True)
     loggers = [
@@ -476,7 +483,6 @@ def main(config_path: str = "config_finetune.yaml", dry_run: bool = False):
         enable_checkpointing=True,
         gradient_clip_val=1.0,
         check_val_every_n_epoch=1,
-        limit_train_batches=limit_train_batches,
         num_sanity_val_steps=0,
         logger=loggers,
         callbacks=callbacks_list,
