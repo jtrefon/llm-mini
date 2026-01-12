@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve this educational project.
+**This repository is now public.** Thanks for helping improve this educational project — please open issues and PRs at https://github.com/jtrefon/llm-mini. See `CODE_OF_CONDUCT.md` for community expectations.
 
 ## What makes a good contribution here
 

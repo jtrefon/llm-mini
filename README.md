@@ -1,5 +1,8 @@
 # Tiny Transformer (Educational LLM From Scratch)
 
+**Public release — This project was migrated to GitHub and is now public.**  
+Repository: https://github.com/jtrefon/llm-mini
+
 An educational, decoder-only Transformer you can read end-to-end: **model**, **data packing**, **training**, **inference**, **checkpoint eval**, and **SFT fine-tuning**.
 
 This is not the Hugging Face `transformers` library (it only uses HF for tokenizers/datasets).
