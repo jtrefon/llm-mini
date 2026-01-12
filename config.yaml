@@ -1,59 +1,76 @@
 model:
-  n_layers: 16            # Number of layers in the model architecture
+  n_layers: 22            # Number of layers in the model architecture
   d_model: 768            # Model dimension
   n_heads: 12             # Number of attention heads
-  n_kv_heads: 2           # GQA: KV heads < Q heads
-  d_ff: 3072              # ~4x d_model, SwiGLU inside will split
+  n_kv_heads: 4           # GQA: KV heads < Q heads
+  d_ff: 2048              # ~4x d_model, SwiGLU inside will split
   dropout: 0.0            # Dropping out tokens to prevent overfitting, specify percentage (0.0 to disable)
   vocab_size: null        # filled from tokenizer
   rope_theta: 1000000     # RoPE base; larger supports longer context
   tie_embeddings: true    # Tie embeddings to prevent overfitting
   swa_window: 0           # set >0 to enable Sliding-Window Attention (tokens can attend last W)
+  gradient_checkpointing: true   # enable to reduce activation memory (slightly slower, much lower RAM)
 
 training:
   seq_len: 1024           # Sequence length
   micro_batch_size: 1     # Micro batch size
-  grad_accum_steps: 32    # effective batch = micro_batch * accum * devices
-  max_steps: 3000         # Maximum number of training steps
-  eval_every: 200         # not used when steps_per_epoch is set; kept for reference
-  save_every: 200         # Save every X steps
-  lr: 2e-4                # learning rate, it's rate of change of loss with respect to parameters, 3e-4 is default  
+  grad_accum_steps: 64    # effective batch = micro_batch * accum * devices
+  max_steps: 20000        # Maximum number of training steps
+  #eval_every: 4000         # not used when steps_per_epoch is set; kept for reference
+  save_every: 100         # Save every X steps
+  lr_schedule: "warmup_cosine"  # "warmup_cosine" (recommended) or "plateau"
+  lr: 3.0e-4              # tuned lower for stability with ~64 sequence effective batch
+  min_lr_ratio: 0.1       # LR floor as a fraction of base lr (used by warmup_cosine)
   weight_decay: 0.1       # it's a regularization term that prevents overfitting, 0.1 is default
   betas: [0.9, 0.95]      # it's a hyperparameter which scale and shift normalized input
   eps: 1.0e-8             # it's a hyperparameter which prevents division by zero
-  warmup_ratio: 0.01      # it's a hyperparameter which controls the amount of warmup steps
-  precision: "32"         # it's a hyperparameter which controls the precision of the optimizer
+  warmup_ratio: 0.02      # it's a hyperparameter which controls the amount of warmup steps
+  precision: "bf16-mixed"        # it's a hyperparameter which controls the precision of the optimizer
+  fused_adamw: true
   seed: 42                # it's a hyperparameter which controls the random seed
-  steps_per_epoch: 200    # align epoch length with desired validation cadence
+  steps_per_epoch: 100    # align epoch length with desired validation cadence
+  # Optional: set to a pretrained checkpoint to initialize SFT from
+  base_ckpt_path: null    # e.g., "checkpoints/final.ckpt" or leave null to skip
+
+  # Resume behavior
+  auto_resume: true
+  reset_lr_on_resume: true  # crucial if max_steps changes or to fix scheduler state on resume
 
   # Learning-rate reduction on plateau (val_loss)
   reduce_on_plateau:
     factor: 0.5           # Factor by which the learning rate will be reduced
-    patience: 2           # Number of epochs with no improvement after which learning rate will be reduced
-    threshold: 0.0        # Threshold for measuring the new optimum, to only focus on significant changes
+    patience: 3           # Slightly longer patience for SFT stability
+    threshold: 0.001      # Ignore tiny noise-level changes
     cooldown: 0           # Number of epochs to wait before resuming normal operation after lr has been reduced
     min_lr: 1.0e-6        # Minimum learning rate
 
   # Early stopping on validation loss
   early_stopping:
-    patience: 5           # Number of epochs with no improvement after which training will be stopped
-    min_delta: 0.0        # Minimum change in the monitored quantity to qualify as an improvement
+    enabled: false         # Set false to disable early stopping entirely
+    patience: 9           # Number of validations with no improvement before stop
+    min_delta: 0.001      # Minimum improvement (absolute) to qualify as progress
+    warmup_fraction: 0.3  # Ignore early-stopping decisions in initial 30% of steps
 
 hardware:
-  accelerator: "mps"      # "mps" on Apple Silicon; use "gpu" on 4090; "auto" also works
+  accelerator: "auto"      # "mps" on Apple Silicon; use "cuda" on NVIDIA; "auto" picks the best available
   devices: 1
-  num_workers: 2
+  num_workers: 8         # Increased for RTX 4090; will be auto-limited to max_shards
 
 # Dataset options. Start with a preprocessed, manageable corpus.
 data:
-  dataset: "shahrukhx01/wikipedia-bookscorpus-en-preprocessed"
+  offline: false          # If true, requires dataset/tokenizer already cached (no network calls)
+  dataset: "wikimedia/wikipedia"
   split: "train"
+  val_split: "train"      # set to a separate split (e.g. "validation") when available
   text_field: "text"
-  streaming: false        # memory-mapped Arrow; set true for huge corpora
+  streaming: true        # memory-mapped Arrow; set true for huge corpora
   tokenizer_name: "gpt2"  # change to a Llama tokenizer later if you have access
-  max_shards: null        # optional: limit shards/rows for quick smoke tests
+  max_shards: 100        # optional: limit shards/rows for quick smoke tests
   pack_sequences: true    # concatenate tokens and pack into fixed-length blocks
+  max_doc_len: 0         # per-document tokenization cap (larger captures more long-form structure)
+  shuffle_buffer: 10000
 
   # Dataset size configuration
-  train_docs: 20000       # Number of training documents
-  val_docs: 2000          # Number of validation documents (separate batch)
+  train_docs: 0          # 0 or null = unlimited documents
+  val_docs: 1000         # Keep validation bounded to avoid extremely long validation runs
+  config: "20231101.en"  # Dataset config for English Wikipedia

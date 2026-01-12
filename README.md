@@ -1,42 +1,108 @@
-# Tiny Transformer Starter (MBP\u2011friendly)
+# Tiny Transformer (Educational LLM From Scratch)
 
-A clean, from\u2011scratch, decoder\u2011only Transformer with **RMSNorm + RoPE + GQA + SwiGLU**, built for a **MacBook M\u2011series (MPS)** first run. Uses **PyTorch Lightning** for painless training. Later, move to an RTX 4090 and crank depth/context & FlashAttention.
+An educational, decoder-only Transformer you can read end-to-end: **model**, **data packing**, **training**, **inference**, **checkpoint eval**, and **SFT fine-tuning**.
+
+This is not the Hugging Face `transformers` library (it only uses HF for tokenizers/datasets).
+
+## Why this exists
+
+Most “train an LLM” repos are either too big to understand, or too abstract to teach. This project aims to be:
+
+- **Readable**: small, explicit code (no hidden magic).
+- **Hackable**: change one thing and see what breaks/helps.
+- **Educational**: enough modern features to be realistic (RoPE, RMSNorm, SwiGLU, GQA, KV cache).
+
+Start here: `docs/LEARNING_PATH.md`.
+
+## What you’ll learn (practical)
+
+- How a decoder-only Transformer produces logits and trains with next-token cross-entropy (`model.py`, `train.py`)
+- How tokenization + document boundaries + packing affect training (`data.py`)
+- Why RoPE/RMSNorm/SwiGLU/GQA exist and where they sit in code (`model.py`)
+- How sampling works (temperature, top-p, top-k, repetition penalty) (`infer.py`)
+- How to compare checkpoints quickly before fine-tuning (`evaluate_checkpoints.py`, `eval_val.py`)
+- How simple instruction fine-tuning works (mask prompt tokens, train on responses) (`finetune.py`)
 
 ## Quickstart
 
+### 0) Requirements
+
+- Python `3.11+`
+- PyTorch `2.3+`
+- One of: Apple Silicon (MPS), NVIDIA (CUDA), or CPU
+
+### 1) Install
+
 ```bash
-# 1) Create venv and install
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# 2) (Optional) Login to HF if you use private tokenizers
-# huggingface-cli login
-
-# 3) Edit config.yaml if you want. Defaults are laptop-safe.
-
-# 4) Train (MBP M\u2011series)
-python train.py --config config.yaml
-
-# 5) Inference
-python infer.py --ckpt checkpoints/final.ckpt --tokenizer gpt2 --prompt "The history of Dubai is"
 ```
 
-## Notes
-- **Tokenizer**: default is `gpt2` for zero\u2011friction. Swap to a Llama\u2011family tokenizer later if you have access. Model `vocab_size` adapts automatically.
-- **Dataset**: defaults to `shahrukhx01/wikipedia-bookscorpus-en-preprocessed` (clean + chunked, a good starter). Change `data.dataset` to `wikimedia/wikipedia` (e.g., `20231101.en`) if you want fresher raw articles; youll still pack them here.
-- **Sequence packing**: the dataset is tokenized and **concatenated then chunked** into `(seq_len+1)` blocks for next\u2011token prediction.
-- **GQA**: reduces KV cache size at inference. Configurable via `n_kv_heads`.
-- **SWA (Sliding\u2011Window Attention)**: set `model.swa_window > 0` to restrict attention to last *W* tokens (near\u2011linear cost). Keep it `0` initially.
-- **Precision**: `16-mixed` on MPS works well. If you hit NaNs, try full `32`.
+### 2) Smoke test (fast, local text)
 
-## Scaling up (4090)
-- Switch `hardware.accelerator: gpu` and bump `model.n_layers`, `d_model`, `training.seq_len: 2048\u20134096`.
-- Install `flash-attn` and replace SDPA with FlashAttention kernels if you like (left as an exercise, since MPS doesn\u2019t support it).
+Runs ~50 steps on `data/tiny_corpus.txt` to prove the pipeline works.
 
-## Finetuning & Reasoning (later)
-- Add instruction SFT with a chat template and DPO/ORPO for alignment.
-- Add a “reasoning switch”: sample k>1 candidates (self\u2011consistency) and optional verifiers.
+```bash
+python3 train.py --config config_smoke.yaml
+python3 infer.py --ckpt checkpoints/final.ckpt --tokenizer gpt2 --prompt "Attention is"
+```
 
----
+### 3) Train (bigger, HF dataset)
 
-# End of embedded repo
+`config.yaml` defaults to streaming Wikipedia.
+
+```bash
+python3 train.py --config config.yaml
+```
+
+### 4) Inference
+
+```bash
+python3 infer.py --ckpt checkpoints/final.ckpt --tokenizer gpt2 --prompt "The history of Dubai is"
+```
+
+### 5) Evaluate checkpoints
+
+```bash
+python3 evaluate_checkpoints.py --checkpoints 'checkpoints/*.ckpt' --tokenizer gpt2 --cases cases/wiki_basics.yaml
+python3 eval_val.py --ckpt checkpoints/best.ckpt --config config.yaml --tokenizer auto
+python3 list.py
+```
+
+### 6) Fine-tune (SFT)
+
+```bash
+python3 finetune.py --config config_finetune.yaml
+```
+
+## Project structure
+
+```
+.
+├── model.py                 # Decoder-only Transformer (RoPE, RMSNorm, SwiGLU, GQA, KV cache)
+├── data.py                  # HF + local text loaders, packing into fixed-length sequences
+├── train.py                 # Pretraining loop (PyTorch Lightning), checkpointing, logging
+├── finetune.py              # Instruction SFT on Alpaca-style data (masked prompt loss)
+├── infer.py                 # Load checkpoint + sample text (temperature/top-p/top-k/etc.)
+├── evaluate_checkpoints.py  # Quick ranking on small prompt/target case files
+├── eval_val.py              # True val_loss / val_ppl for a checkpoint + config dataloader
+├── list.py                  # Inspect checkpoints (epoch/step/loss metadata)
+├── config_smoke.yaml        # Fast local smoke test config
+├── config.yaml              # Default training config (HF dataset)
+├── config_finetune.yaml     # Default SFT config (HF dataset)
+└── docs/                    # Educational walkthroughs
+```
+
+## Docs
+
+- `docs/LEARNING_PATH.md` — suggested order + “what to read first”
+- `docs/CONFIG_REFERENCE.md` — config knobs and what they do
+- `docs/TROUBLESHOOTING.md` — common issues (MPS/CUDA/CPU, OOM, offline mode)
+
+## Contributing
+
+See `CONTRIBUTING.md`.
+
+## License
+
+Apache 2.0. See `LICENSE`.

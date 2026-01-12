@@ -1,0 +1,11 @@
+This repository is a small educational Transformer you can read end to end.
+The model is trained with next-token prediction: given previous tokens, predict the next one.
+Attention lets every token look at earlier tokens, but not future tokens (causal masking).
+RoPE encodes positions by rotating query and key vectors using sine and cosine.
+RMSNorm normalizes activations without subtracting the mean.
+SwiGLU uses a gated activation to improve MLP expressiveness.
+Grouped-Query Attention shares key/value heads across multiple query heads.
+Gradient accumulation simulates larger batches without increasing memory usage.
+Perplexity is exp(cross-entropy) and is a common language-model metric.
+Fine-tuning can teach instruction following by masking the prompt tokens in the loss.
+Always keep a validation set to detect overfitting and tune learning rates.

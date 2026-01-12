@@ -1,0 +1,162 @@
+- name: Arithmetic 2+2
+  prompt: "2 + 2 ="
+  target: " 4"
+- name: Arithmetic 3+4
+  prompt: "3 + 4 ="
+  target: " 7"
+- name: Arithmetic 5+6
+  prompt: "5 + 6 ="
+  target: " 11"
+- name: Arithmetic 7+8
+  prompt: "7 + 8 ="
+  target: " 15"
+- name: Arithmetic 9+9
+  prompt: "9 + 9 ="
+  target: " 18"
+- name: Arithmetic 12+5
+  prompt: "12 + 5 ="
+  target: " 17"
+- name: Arithmetic 13+7
+  prompt: "13 + 7 ="
+  target: " 20"
+- name: Arithmetic 14+8
+  prompt: "14 + 8 ="
+  target: " 22"
+- name: Arithmetic 15+17
+  prompt: "15 + 17 ="
+  target: " 32"
+- name: Arithmetic 21+21
+  prompt: "21 + 21 ="
+  target: " 42"
+- name: Arithmetic 30+12
+  prompt: "30 + 12 ="
+  target: " 42"
+- name: Arithmetic 50+50
+  prompt: "50 + 50 ="
+  target: " 100"
+- name: Arithmetic 100+200
+  prompt: "100 + 200 ="
+  target: " 300"
+- name: Arithmetic 5-2
+  prompt: "5 - 2 ="
+  target: " 3"
+- name: Arithmetic 10-3
+  prompt: "10 - 3 ="
+  target: " 7"
+- name: Arithmetic 12-5
+  prompt: "12 - 5 ="
+  target: " 7"
+- name: Arithmetic 20-8
+  prompt: "20 - 8 ="
+  target: " 12"
+- name: Arithmetic 42-17
+  prompt: "42 - 17 ="
+  target: " 25"
+- name: Arithmetic 100-1
+  prompt: "100 - 1 ="
+  target: " 99"
+- name: Arithmetic 1000-1
+  prompt: "1000 - 1 ="
+  target: " 999"
+- name: Arithmetic 2*3
+  prompt: "2 * 3 ="
+  target: " 6"
+- name: Arithmetic 3*3
+  prompt: "3 * 3 ="
+  target: " 9"
+- name: Arithmetic 4*5
+  prompt: "4 * 5 ="
+  target: " 20"
+- name: Arithmetic 6*7
+  prompt: "6 * 7 ="
+  target: " 42"
+- name: Arithmetic 8*8
+  prompt: "8 * 8 ="
+  target: " 64"
+- name: Arithmetic 9*9
+  prompt: "9 * 9 ="
+  target: " 81"
+- name: Arithmetic 12*12
+  prompt: "12 * 12 ="
+  target: " 144"
+- name: Arithmetic 8/2
+  prompt: "8 / 2 ="
+  target: " 4"
+- name: Arithmetic 9/3
+  prompt: "9 / 3 ="
+  target: " 3"
+- name: Arithmetic 12/3
+  prompt: "12 / 3 ="
+  target: " 4"
+- name: Arithmetic 100/10
+  prompt: "100 / 10 ="
+  target: " 10"
+- name: Opposite hot
+  prompt: "The opposite of hot is"
+  target: " cold"
+- name: Opposite cold
+  prompt: "The opposite of cold is"
+  target: " hot"
+- name: Opposite up
+  prompt: "The opposite of up is"
+  target: " down"
+- name: Opposite day
+  prompt: "The opposite of day is"
+  target: " night"
+- name: Opposite big
+  prompt: "The opposite of big is"
+  target: " small"
+- name: Opposite inside
+  prompt: "The opposite of inside is"
+  target: " outside"
+- name: Opposite true
+  prompt: "The opposite of true is"
+  target: " false"
+- name: Months in year
+  prompt: "There are"
+  target: " 12"
+- name: A dozen
+  prompt: "A dozen is"
+  target: " 12"
+- name: A century
+  prompt: "A century is"
+  target: " 100"
+- name: Days in week
+  prompt: "There are 7 days in a"
+  target: " week"
+- name: Hours in day
+  prompt: "There are 24 hours in a"
+  target: " day"
+- name: Minutes in hour
+  prompt: "There are 60 minutes in an"
+  target: " hour"
+- name: Seconds in minute
+  prompt: "There are 60 seconds in a"
+  target: " minute"
+- name: First month
+  prompt: "The first month of the year is"
+  target: " January"
+- name: Last month
+  prompt: "The last month of the year is"
+  target: " December"
+- name: Primary colors 1
+  prompt: "Red, green, and blue are"
+  target: " primary"
+- name: Triangle sides
+  prompt: "A triangle has"
+  target: " three"
+- name: Square sides
+  prompt: "A square has"
+  target: " four"
+- name: Water freezes
+  prompt: "Water freezes at"
+  target: " 0"
+- name: Water boils
+  prompt: "At sea level, water boils at 100 degrees"
+  target: " Celsius"
+- name: Earth satellite
+  prompt: "The Earth revolves around the"
+  target: " Sun"
+- name: Chemical water
+  prompt: "The chemical formula for water is"
+  target: " H2O"

@@ -1,68 +1,63 @@
 import os
-# Set env early to affect torch/PL and dataloader workers
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.pop("MallocStackLogging", None)
-os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
-
 import yaml
 import math
 import logging
+import argparse
 from datetime import datetime
 from pathlib import Path
 import re
 import shutil
+import glob
+import warnings
+from typing import Optional, List, Any, Dict
+import time
+import sys
+
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 from model import GPTMini, GPTConfig
 from data import make_dataloaders, get_tokenizer
-import glob
-import warnings
+
+# Set defaults for convenience, but respect external envs
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+try:
+    import torch
+    torch.set_float32_matmul_precision("high")
+    if torch.backends.cuda is not None:
+        torch.backends.cuda.matmul.allow_tf32 = True
+except Exception:
+    pass
 
 
 class WarmupCosine:
-    def __init__(self, warmup_ratio: float, max_steps: int):
+    def __init__(self, warmup_ratio: float, max_steps: int, min_lr_ratio: float = 0.0):
         self.warmup_steps = max(1, int(warmup_ratio * max_steps))
         self.max_steps = max_steps
+        try:
+            r = float(min_lr_ratio)
+        except Exception:
+            r = 0.0
+        self.min_lr_ratio = min(1.0, max(0.0, r))
 
-    def __call__(self, step):
-        if step < self.warmup_steps:
-            return step / self.warmup_steps
-        progress = (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
-        return 0.5 * (1 + math.cos(math.pi * progress))
-
-
-class EarlyStoppingRespectConfig(EarlyStopping):
-    """EarlyStopping that preserves patience from config on resume.
-
-    PyTorch Lightning restores callback state from checkpoints, including the
-    "patience" and current "wait_count". If the checkpoint was created with a
-    different patience (e.g., 3) and you later increase it in config (e.g., 5),
-    the restored state would override your new value and stop too early.
-
-    This subclass keeps the configured patience across resume, and optionally
-    resets the wait counter so you don't immediately stop after resuming.
-    """
-
-    def __init__(self, *args, configured_patience: int | None = None, reset_wait_on_resume: bool = True, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Keep the configured patience regardless of what the checkpoint contains
-        self._configured_patience = configured_patience if configured_patience is not None else self.patience
-        self._reset_wait_on_resume = reset_wait_on_resume
-        self.patience = self._configured_patience
-
-    def load_state_dict(self, state_dict):
-        # Restore best_score and counters, then enforce new patience
-        super().load_state_dict(state_dict)
-        self.patience = self._configured_patience
-        if self._reset_wait_on_resume:
-            self.wait_count = 0
+    def __call__(self, step: int) -> float:
+        # Scheduler `step` is 0-indexed in most PyTorch schedulers; avoid returning 0
+        # so the first scheduled LR is warmup_steps^{-1} * base_lr.
+        s = int(step) + 1
+        if s <= self.warmup_steps:
+            return s / self.warmup_steps
+        denom = max(1, self.max_steps - self.warmup_steps)
+        progress = (s - self.warmup_steps) / denom
+        progress = min(1.0, max(0.0, float(progress)))
+        cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Apply an LR floor so the schedule approaches (min_lr_ratio * base_lr) at the end.
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cos
 
 
 class LitCausalLM(pl.LightningModule):
-    def __init__(self, cfg, tokenizer):
+    def __init__(self, cfg: Dict[str, Any], tokenizer: Any):
         super().__init__()
         self.save_hyperparameters(cfg)
         self.cfg = cfg
@@ -77,85 +72,372 @@ class LitCausalLM(pl.LightningModule):
             dropout=cfg['model']['dropout'],
             rope_theta=cfg['model']['rope_theta'],
             tie_embeddings=cfg['model']['tie_embeddings'],
-            swa_window=cfg['model']['swa_window']
+            swa_window=cfg['model']['swa_window'],
+            gradient_checkpointing=bool(cfg['model'].get('gradient_checkpointing', False)),
         )
         self.net = GPTMini(mcfg)
+        self._compiled_forward = None
+        self._using_fused_adamw = False
+        tcfg = cfg.get("training", {})
+        compile_cfg = tcfg.get("torch_compile", None)
+        accelerator = str(cfg.get("hardware", {}).get("accelerator", "auto")).lower()
+        if compile_cfg is None:
+            self._torch_compile_enabled = bool(
+                (accelerator in {"cuda", "auto"}) and torch.cuda.is_available()
+            )
+        else:
+            self._torch_compile_enabled = bool(compile_cfg)
+        self._torch_compile_mode = str(tcfg.get("torch_compile_mode", "default"))
+        
+        # Cap model size ~200M params for lightweight usage
+        param_count = sum(p.numel() for p in self.net.parameters())
+        print(f"Model initialized with {param_count:,} parameters")
 
-    def forward(self, input_ids):
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self._compiled_forward is not None:
+            compiler_mod = getattr(torch, "compiler", None)
+            mark_step_begin = getattr(compiler_mod, "cudagraph_mark_step_begin", None)
+            if mark_step_begin is not None:
+                try:
+                    mark_step_begin()
+                except Exception:
+                    pass
+            return self._compiled_forward(input_ids)
         return self.net(input_ids)
 
-    def training_step(self, batch, batch_idx):
+    def on_fit_start(self) -> None:
+        if not getattr(self, "_torch_compile_enabled", False):
+            return
+        if self._compiled_forward is not None:
+            return
+        if getattr(self, "device", None) is None or self.device.type != "cuda":
+            return
+        compile_fn = getattr(torch, "compile", None)
+        if compile_fn is None:
+            return
+
+        try:
+            seq_len = int(self.cfg.get("training", {}).get("seq_len", 0) or 0)
+        except Exception:
+            seq_len = 0
+        if seq_len > 0:
+            try:
+                head_dim = int(self.net.config.d_model) // int(self.net.config.n_heads)
+                with torch.no_grad():
+                    self.net._maybe_build_rope(
+                        seq_len,
+                        head_dim,
+                        float(self.net.config.rope_theta),
+                        self.device,
+                        torch.float32,
+                    )
+            except Exception as exc:
+                print(f"[Train] RoPE cache prebuild failed; continuing: {exc}")
+
+        try:
+            self._compiled_forward = torch.compile(
+                self.net.forward, mode=self._torch_compile_mode
+            )
+            print(f"[Train] torch.compile enabled (mode={self._torch_compile_mode})")
+        except TypeError:
+            try:
+                self._compiled_forward = torch.compile(self.net.forward)
+                print("[Train] torch.compile enabled")
+            except Exception as exc:
+                self._compiled_forward = None
+                print(f"[Train] torch.compile failed; continuing without: {exc}")
+        except Exception as exc:
+            self._compiled_forward = None
+            print(f"[Train] torch.compile failed; continuing without: {exc}")
+
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         input_ids = batch['input_ids']
         labels = batch['labels']
         logits = self(input_ids)
         loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), labels.view(-1)
+            logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
         )
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         input_ids = batch['input_ids']
         labels = batch['labels']
         logits = self(input_ids)
         loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), labels.view(-1)
+            logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
         )
+        if torch.isnan(loss) or torch.isinf(loss):
+            loss = torch.tensor(10.0, device=loss.device)
         self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
+        ppl = torch.exp(loss)
+        self.log('val_ppl', ppl, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
+    def configure_gradient_clipping(
+        self,
+        optimizer: torch.optim.Optimizer,
+        gradient_clip_val: Optional[float] = None,
+        gradient_clip_algorithm: Optional[str] = None,
+    ) -> None:
+        if getattr(self, "_using_fused_adamw", False):
+            return
+        return super().configure_gradient_clipping(
+            optimizer, gradient_clip_val, gradient_clip_algorithm
+        )
+
     def configure_optimizers(self):
-        optimizer = AdamW(
-            self.parameters(),
-            lr=float(self.cfg['training']['lr']),
-            betas=tuple(self.cfg['training']['betas']),
-            eps=float(self.cfg['training']['eps']),
-            weight_decay=float(self.cfg['training']['weight_decay'])
-        )
+        # Parameter groups: apply weight decay to weights (ndim>=2), not to biases/norms
+        wd = float(self.cfg['training']['weight_decay'])
+        lr = float(self.cfg['training']['lr'])
+        betas = tuple(self.cfg['training']['betas'])
+        eps = float(self.cfg['training']['eps'])
 
-        # Warmup + cosine decay per-step
-        max_steps = self.cfg['training']['max_steps']
-        warm = WarmupCosine(self.cfg['training']['warmup_ratio'], max_steps)
-        step_sched = LambdaLR(optimizer, lr_lambda=warm)
+        decay_params = []
+        nodecay_params = []
+        for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim >= 2:
+                decay_params.append(p)
+            else:
+                nodecay_params.append(p)
 
-        # Reduce LR on plateau (monitor validation loss)
-        r_cfg = self.cfg['training'].get('reduce_on_plateau', {})
-        plateau_sched = ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=float(r_cfg.get('factor', self.cfg['training']['reduce_on_plateau']['factor'])),
-            patience=r_cfg.get('patience', self.cfg['training']['reduce_on_plateau']['patience']),
-            threshold=float(r_cfg.get('threshold', self.cfg['training']['reduce_on_plateau']['threshold'])),
-            cooldown=r_cfg.get('cooldown', self.cfg['training']['reduce_on_plateau']['cooldown']),
-            min_lr=float(r_cfg.get('min_lr', self.cfg['training']['reduce_on_plateau']['min_lr'])),
-        )
-
-        scheds = [
-            {
-                'scheduler': step_sched,
-                'interval': 'step',
-                'frequency': 1
-            },
-            {
-                'scheduler': plateau_sched,
-                'reduce_on_plateau': True,
-                'monitor': 'val_loss',
-                'interval': 'epoch',
-                'frequency': 1
-            }
+        param_groups = [
+            {'params': decay_params, 'weight_decay': wd},
+            {'params': nodecay_params, 'weight_decay': 0.0},
         ]
-        return [optimizer], scheds
+        tcfg = self.cfg.get("training", {})
+        fused_cfg = tcfg.get("fused_adamw", None)
+        accelerator = str(self.cfg.get("hardware", {}).get("accelerator", "auto")).lower()
+        if fused_cfg is None:
+            want_fused = bool((accelerator in {"cuda", "auto"}) and torch.cuda.is_available())
+        else:
+            want_fused = bool(fused_cfg)
+
+        if want_fused:
+            try:
+                optimizer = AdamW(
+                    param_groups,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    fused=True,
+                )
+                print("[Train] Using fused AdamW")
+                self._using_fused_adamw = True
+            except Exception as exc:
+                optimizer = AdamW(param_groups, lr=lr, betas=betas, eps=eps)
+                print(f"[Train] Fused AdamW unavailable; falling back: {exc}")
+                self._using_fused_adamw = False
+        else:
+            optimizer = AdamW(param_groups, lr=lr, betas=betas, eps=eps)
+            self._using_fused_adamw = False
+
+        lr_schedule = str(self.cfg["training"].get("lr_schedule", "warmup_cosine")).lower()
+        if lr_schedule in {"warmup_cosine", "cosine"}:
+            max_steps = int(self.cfg["training"]["max_steps"])
+            lr_schedule_max_steps = int(self.cfg["training"].get("lr_schedule_max_steps", max_steps) or max_steps)
+            warmup_ratio = float(self.cfg["training"].get("warmup_ratio", 0.0))
+            min_lr_ratio = float(self.cfg["training"].get("min_lr_ratio", 0.0) or 0.0)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=WarmupCosine(warmup_ratio, lr_schedule_max_steps, min_lr_ratio=min_lr_ratio)
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
+
+        # Fallback: constant LR (or external callbacks can mutate optimizer LR).
+        return optimizer
 
 
-def find_latest_checkpoint():
-    """Find the most advanced checkpoint (by global step), or newest if unknown.
+class ReduceLROnPlateauOnVal(pl.Callback):
+    """Reduce LR when val_loss plateaus without conflicting with warmup."""
+    def __init__(self, patience=2, factor=0.5, min_lr=1e-6, cooldown=0, threshold=0.0,
+                 monitor="val_loss", mode="min", warmup_steps: int = 0):
+        self.patience = int(patience)
+        self.factor = float(factor)
+        self.min_lr = float(min_lr)
+        self.cooldown = int(cooldown)
+        self.threshold = float(threshold)
+        self.monitor = monitor
+        self.mode = mode
+        self.best = float("inf") if mode == "min" else -float("inf")
+        self.bad = 0
+        self.cool = 0
+        self._warmup_steps = int(max(0, warmup_steps))
 
-    Searches both `checkpoints/` and legacy `lightning_logs/.../checkpoints/`.
-    Prefers higher parsed step from filename patterns, else falls back to mtime.
-    """
+    def _improved(self, cur: float) -> bool:
+        return (self.best - cur) > self.threshold if self.mode == "min" else (cur - self.best) > self.threshold
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.global_step < self._warmup_steps:
+            return
+        if self.monitor not in trainer.callback_metrics:
+            return
+        cur = float(trainer.callback_metrics[self.monitor])
+        if self._improved(cur):
+            self.best = cur
+            self.bad = 0
+            if self.cool > 0:
+                self.cool -= 1
+            return
+        self.bad += 1
+        if self.cool > 0:
+            self.cool -= 1
+            return
+        if self.bad > self.patience and trainer.optimizers:
+            opt = trainer.optimizers[0]
+            for pg in opt.param_groups:
+                pg["lr"] = max(self.min_lr, pg["lr"] * self.factor)
+            try:
+                new_lr = opt.param_groups[0]["lr"]
+                print(f"[Train] LR reduced to {new_lr:.6g}")
+            except Exception:
+                pass
+            self.bad = 0
+            self.cool = self.cooldown
+
+
+class WarmupLRCallback(pl.Callback):
+    """Linearly warm up LR over first N steps."""
+
+    def __init__(self, warmup_steps: int):
+        super().__init__()
+        self.warmup_steps = max(1, int(warmup_steps))
+        self.base_lrs = None
+        self._resume_step: Optional[int] = None
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        try:
+            step = checkpoint.get("global_step", None)
+        except Exception:
+            step = None
+        if step is None:
+            return
+        try:
+            self._resume_step = int(step)
+        except Exception:
+            self._resume_step = None
+
+    def on_fit_start(self, trainer, pl_module):
+        return
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if not trainer.optimizers:
+            return
+        if self._resume_step is not None:
+            try:
+                step_now = int(getattr(trainer, "global_step", 0) or 0)
+            except Exception:
+                step_now = 0
+            if step_now < int(self._resume_step):
+                return
+
+        if self.base_lrs is None:
+            opt = trainer.optimizers[0]
+            self.base_lrs = [g.get('lr', 0.0) for g in opt.param_groups]
+
+        if self.base_lrs is None:
+            return
+        step = trainer.global_step
+        if step >= self.warmup_steps:
+            return
+        frac = float(step + 1) / float(self.warmup_steps)
+        opt = trainer.optimizers[0]
+        for g, base in zip(opt.param_groups, self.base_lrs):
+            g['lr'] = base * frac
+
+
+class ResetLROnResumeCallback(pl.Callback):
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__()
+        self._cfg = cfg
+        self._resume_step: Optional[int] = None
+        self._done = False
+
+    def on_load_checkpoint(self, trainer, pl_module, checkpoint):
+        try:
+            step = checkpoint.get("global_step", None)
+        except Exception:
+            step = None
+        if step is None:
+            return
+        try:
+            self._resume_step = int(step)
+        except Exception:
+            self._resume_step = None
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if self._done:
+            return
+        if self._resume_step is None:
+            return
+        try:
+            step_now = int(getattr(trainer, "global_step", 0) or 0)
+        except Exception:
+            step_now = 0
+        if step_now < int(self._resume_step):
+            return
+
+        tcfg = self._cfg.get("training", {})
+        lr_schedule = str(tcfg.get("lr_schedule", "warmup_cosine")).lower()
+        if lr_schedule not in {"warmup_cosine", "cosine"}:
+            self._done = True
+            return
+
+        if not trainer.optimizers:
+            self._done = True
+            return
+        opt = trainer.optimizers[0]
+
+        base_lr = float(tcfg.get("lr", 0.0) or 0.0)
+        warmup_ratio = float(tcfg.get("warmup_ratio", 0.0) or 0.0)
+        max_steps = int(tcfg.get("max_steps", 0) or 0)
+        lr_schedule_max_steps = int(tcfg.get("lr_schedule_max_steps", max_steps) or max_steps)
+        min_lr_ratio = float(tcfg.get("min_lr_ratio", 0.0) or 0.0)
+        if lr_schedule_max_steps <= 0 or base_lr <= 0:
+            self._done = True
+            return
+
+        mult = WarmupCosine(warmup_ratio, lr_schedule_max_steps, min_lr_ratio=min_lr_ratio)(step_now)
+        new_lr = float(base_lr) * float(mult)
+        for pg in opt.param_groups:
+            pg["lr"] = new_lr
+
+        try:
+            lrs_cfgs = getattr(trainer, "lr_scheduler_configs", None)
+        except Exception:
+            lrs_cfgs = None
+        if lrs_cfgs:
+            for cfg in lrs_cfgs:
+                sch = getattr(cfg, "scheduler", None)
+                if sch is None:
+                    continue
+                try:
+                    sch.base_lrs = [base_lr for _ in opt.param_groups]
+                except Exception:
+                    pass
+                try:
+                    sch.last_epoch = int(step_now) - 1
+                except Exception:
+                    pass
+        try:
+            trainer.print(f"[Train] Reset LR on resume at step={step_now} -> lr={new_lr:.6g}")
+        except Exception:
+            pass
+        self._done = True
+
+
+def find_latest_checkpoint(config_ckpt_dir: str = 'checkpoints') -> Optional[str]:
+    """Find the most advanced checkpoint by filename step parsing."""
     patterns = [
-        "checkpoints/*.ckpt",  # current default dir
-        "lightning_logs/version_*/checkpoints/*.ckpt",  # legacy PL dir
+        f"{config_ckpt_dir}/*.ckpt",
+        "lightning_logs/version_*/checkpoints/*.ckpt",
     ]
     checkpoints = []
     for pat in patterns:
@@ -164,23 +446,22 @@ def find_latest_checkpoint():
     if not checkpoints:
         return None
 
+    # Prefer explicit "last" checkpoints if they exist; these are the right choice
+    # for continuing training because they include the latest optimizer/scheduler state.
+    # They often don't encode step in filename (e.g. last.ckpt, last-v2.ckpt), so
+    # step-parsing would incorrectly deprioritize them.
+    last_candidates = glob.glob(os.path.join(config_ckpt_dir, "last*.ckpt"))
+    last_candidates = [p for p in last_candidates if os.path.isfile(p)]
+    if last_candidates:
+        last_candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return last_candidates[0]
+
     def parse_step(path: str) -> int:
         name = os.path.basename(path)
-        # epoch={E}-step={S}-...
         m = re.search(r"step=(\d+)", name)
-        if m:
-            return int(m.group(1))
-        # global_step={S}
+        if m: return int(m.group(1))
         m = re.search(r"global_step=(\d+)", name)
-        if m:
-            return int(m.group(1))
-        # legacy like "E-S.ckpt" -> treat as epoch-step
-        m = re.match(r"(\d+)-(\d+)\.ckpt$", name)
-        if m:
-            try:
-                return int(m.group(2))
-            except Exception:
-                return -1
+        if m: return int(m.group(1))
         return -1
 
     scored = []
@@ -194,190 +475,208 @@ def find_latest_checkpoint():
     return scored[0][2]
 
 
-def discover_checkpoints():
-    patterns = [
-        "checkpoints/*.ckpt",
-        "lightning_logs/version_*/checkpoints/*.ckpt",
-    ]
-    seen = set()
-    result = []
-    for pat in patterns:
-        for p in glob.glob(pat):
-            if p not in seen:
-                seen.add(p)
-                result.append(p)
-    # newest first for display
-    result.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return result
-
-
-def parse_ckpt_metadata(path):
-    """Best-effort parse of epoch, step, val_loss from filename."""
-    name = os.path.basename(path)
-    epoch = step = None
-    val_loss = None
-    m = re.search(r"epoch=(\d+).*step=(\d+).*val_loss=([0-9]+(?:\.[0-9]+)?)", name)
-    if m:
-        return int(m.group(1)), int(m.group(2)), float(m.group(3))
-    m = re.search(r"epoch=(\d+).*step=(\d+)", name)
-    if m:
-        return int(m.group(1)), int(m.group(2)), None
-    m = re.search(r"global_step=(\d+)", name)
-    if m:
-        return None, int(m.group(1)), None
-    m = re.match(r"(\d+)-(\d+)\.ckpt$", name)
-    if m:
-        try:
-            return int(m.group(1)), int(m.group(2)), None
-        except Exception:
-            pass
-    return epoch, step, val_loss
-
-
-def select_checkpoint_interactively():
-    ckpts = discover_checkpoints()
-    if not ckpts:
-        return None
-
-    infos = []
-    for p in ckpts:
-        ep, st, vl = parse_ckpt_metadata(p)
-        infos.append({
-            'path': p,
-            'name': os.path.basename(p),
-            'epoch': ep,
-            'step': st,
-            'val_loss': vl,
-            'mtime': os.path.getmtime(p),
-        })
-
-    def best_by_val():
-        c = [i for i in infos if i['val_loss'] is not None]
-        return min(c, key=lambda i: i['val_loss']) if c else None
-
-    def best_by_step():
-        c = [i for i in infos if i['step'] is not None]
-        return max(c, key=lambda i: i['step']) if c else None
-
-    def newest():
-        return max(infos, key=lambda i: i['mtime'])
-
-    print("\n🔍 Found the following checkpoints:\n")
-    for idx, i in enumerate(infos, 1):
-        ep = i['epoch'] if i['epoch'] is not None else '-'
-        st = i['step'] if i['step'] is not None else '-'
-        vl = f"{i['val_loss']:.3f}" if i['val_loss'] is not None else '-'
-        print(f"[{idx}] {i['name']}\t(epoch={ep}, step={st}, val_loss={vl})")
-
-    print("\nEnter a number to resume from that checkpoint.")
-    print("Or press: 'b' = lowest val_loss, 's' = highest step, 'n' = start fresh, Enter = default (b>s>newest)")
-
-    while True:
-        sel = input("Selection: ").strip().lower()
-        if sel == '':
-            choice = best_by_val() or best_by_step() or newest()
-            print(f"Default selection: {choice['name']}")
-            return choice['path']
-        if sel in ('n', 'no'):
-            return None
-        if sel == 'b':
-            ch = best_by_val()
-            if ch:
-                print(f"Best val_loss: {ch['name']}")
-                return ch['path']
-            print("No checkpoints with val_loss found.")
-            continue
-        if sel == 's':
-            ch = best_by_step()
-            if ch:
-                print(f"Highest step: {ch['name']}")
-                return ch['path']
-            print("No checkpoints with step found.")
-            continue
-        if sel.isdigit():
-            i = int(sel)
-            if 1 <= i <= len(infos):
-                print(f"Selected: {infos[i-1]['name']}")
-                return infos[i-1]['path']
-        print("Invalid selection. Try again.")
-
-
-def prompt_checkpoint_recovery(checkpoint_path):
-    """Ask user if they want to recover from checkpoint."""
-    checkpoint_name = os.path.basename(checkpoint_path)
-
-    print(f"\n🔍 Found existing checkpoint: {checkpoint_name}")
-    print(f"📁 Location: {checkpoint_path}")
-
-    # Try to extract epoch and step info from filename (several patterns)
+def _checkpoint_hparams(path: str) -> Dict[str, Any]:
     try:
-        epoch_part = None
-        step_part = None
-        m = re.search(r"epoch=(\d+).*step=(\d+)", checkpoint_name)
-        if m:
-            epoch_part, step_part = m.group(1), m.group(2)
-        else:
-            m = re.search(r"global_step=(\d+)", checkpoint_name)
-            if m:
-                step_part = m.group(1)
-            else:
-                m = re.match(r"(\d+)-(\d+)\.ckpt$", checkpoint_name)
-                if m:
-                    epoch_part, step_part = m.group(1), m.group(2)
-        if epoch_part or step_part:
-            info = []
-            if epoch_part:
-                info.append(f"Epoch {epoch_part}")
-            if step_part:
-                info.append(f"Step {step_part}")
-            print("📊 Checkpoint info: " + ", ".join(info))
+        try:
+            ckpt = torch.load(path, map_location="cpu", weights_only=True)  # PyTorch 2.2+
+        except TypeError:
+            ckpt = torch.load(path, map_location="cpu")
     except Exception:
-        pass
+        return {}
+    hp = ckpt.get("hyper_parameters", {})
+    return hp if isinstance(hp, dict) else {}
 
-    while True:
-        response = input("\nDo you want to RESUME training from this checkpoint? (y/n): ").strip().lower()
-        if response in ['y', 'yes']:
-            return True
-        elif response in ['n', 'no']:
-            return False
-        else:
-            print("Please enter 'y' for yes or 'n' for no.")
+
+def _is_resume_compatible(ckpt_path: str, cfg: Dict[str, Any]) -> bool:
+    """Best-effort compatibility check to avoid strict-load crashes on auto-resume."""
+    hp = _checkpoint_hparams(ckpt_path)
+    if not hp:
+        return True
+    saved_model = hp.get("model", {}) if isinstance(hp.get("model", {}), dict) else {}
+    cur_model = cfg.get("model", {}) if isinstance(cfg.get("model", {}), dict) else {}
+
+    keys = (
+        "n_layers",
+        "d_model",
+        "n_heads",
+        "n_kv_heads",
+        "d_ff",
+        "rope_theta",
+        "tie_embeddings",
+        "swa_window",
+    )
+    for k in keys:
+        if k in saved_model and k in cur_model:
+            if str(saved_model.get(k)) != str(cur_model.get(k)):
+                print(
+                    f"[Train] Auto-resume skipped: checkpoint model.{k}={saved_model.get(k)!r} "
+                    f"!= config model.{k}={cur_model.get(k)!r}"
+                )
+                return False
+
+    return True
 
 
 class MetricsLoggingCallback(pl.Callback):
     """Logs key metrics to a rotating timestamped file in logs/ directory."""
-    def __init__(self, log_file: Path):
+    def __init__(self, log_file: Path, print_to_stdout: bool = False):
         super().__init__()
         self.log_file = log_file
+        self._print_to_stdout = bool(print_to_stdout)
+        self._header_written = False
+        self._train_batches_seen = 0
+        self._last_logged_step: Optional[int] = None
+        self._last_log_time_s: Optional[float] = None
+        self._last_logged_train_batches_seen: int = 0
+        self._last_train_loss_step: Optional[float] = None
+        self._last_val_loss: Optional[float] = None
+        self._last_val_ppl: Optional[float] = None
+
+    def _format_eta(self, seconds: Optional[float]) -> str:
+        if seconds is None:
+            return "-"
+        try:
+            if not math.isfinite(seconds) or seconds < 0:
+                return "-"
+            s = int(seconds)
+        except Exception:
+            return "-"
+        h = s // 3600
+        m = (s % 3600) // 60
+        s = s % 60
+        if h > 0:
+            return f"{h:d}:{m:02d}:{s:02d}"
+        return f"{m:d}:{s:02d}"
 
     def on_fit_start(self, trainer, pl_module):
-        self._log_header()
+        if trainer.is_global_zero and not self._header_written:
+            self._append_line("timestamp | kind | step | max_steps | progress | eta | epoch | train_batches | mb_per_s | tok_per_s | train_loss_step | val_loss | val_ppl | lr")
+            self._header_written = True
 
-    def on_validation_epoch_end(self, trainer, pl_module):
-        # Collect metrics at the end of validation epoch (where val_loss is available)
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not trainer.is_global_zero:
+            return
+
+        self._train_batches_seen += 1
+
+        tcfg = getattr(pl_module, "cfg", {}).get("training", {}) if hasattr(pl_module, "cfg") else {}
+        every_steps = int(tcfg.get("metrics_log_every_n_steps", 50) or 50)
+        every_secs = float(tcfg.get("metrics_log_every_seconds", 60) or 60)
+        step = int(trainer.global_step)
+
+        now = time.monotonic()
+        if self._last_log_time_s is None:
+            self._last_log_time_s = now
+
+        step_advanced = (self._last_logged_step is None) or (step != self._last_logged_step)
+        log_on_step = (
+            step_advanced
+            and every_steps > 0
+            and step > 0
+            and (step % every_steps) == 0
+        )
+        log_on_time = every_secs > 0 and (now - float(self._last_log_time_s)) >= every_secs
+
+        if not (log_on_step or log_on_time):
+            return
+
         metrics = trainer.callback_metrics
-        train_loss = metrics.get('train_loss_epoch')
-        val_loss = metrics.get('val_loss')
-        # Current LR from first optimizer param group
+        train_loss_step = metrics.get("train_loss_step")
+        if train_loss_step is None:
+            train_loss_step = metrics.get("train_loss")
+        if train_loss_step is not None:
+            try:
+                self._last_train_loss_step = float(train_loss_step)
+            except Exception:
+                pass
+
         lr = None
         if trainer.optimizers:
             try:
-                lr = trainer.optimizers[0].param_groups[0].get('lr', None)
+                lr = trainer.optimizers[0].param_groups[0].get("lr", None)
+            except Exception:
+                lr = None
+
+        dt = max(1e-6, now - float(self._last_log_time_s))
+        mb_delta = max(0, int(self._train_batches_seen) - int(self._last_logged_train_batches_seen))
+        mb_per_s = float(mb_delta) / dt
+        micro_bsz = int(getattr(pl_module, "cfg", {}).get("training", {}).get("micro_batch_size", 1) or 1)
+        seq_len = int(getattr(pl_module, "cfg", {}).get("training", {}).get("seq_len", 0) or 0)
+        tok_per_s = float(micro_bsz * seq_len) * mb_per_s if seq_len > 0 else 0.0
+        grad_accum = int(tcfg.get("grad_accum_steps", 1) or 1)
+        opt_steps_per_s = (mb_per_s / float(grad_accum)) if grad_accum > 0 else 0.0
+
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        epoch = int(trainer.current_epoch)
+        max_steps = int(getattr(trainer, "max_steps", 0) or 0)
+        if max_steps > 0:
+            pct = 100.0 * float(step) / float(max_steps)
+            progress = f"{pct:.2f}%"
+            eta_s = (float(max_steps - step) / opt_steps_per_s) if opt_steps_per_s > 0 else None
+        else:
+            progress = "-"
+            eta_s = None
+        eta = self._format_eta(eta_s)
+
+        line = f"{ts} | kind=train | step={step} | max_steps={max_steps} | progress={progress} | eta={eta} | epoch={epoch}"
+        line += f" | train_batches={int(self._train_batches_seen)} | mb_per_s={mb_per_s:.2f} | tok_per_s={tok_per_s:.0f}"
+        line += f" | train_loss_step={float(self._last_train_loss_step):.6g}" if self._last_train_loss_step is not None else " | train_loss_step=-"
+        line += f" | val_loss={float(self._last_val_loss):.6g}" if self._last_val_loss is not None else " | val_loss=-"
+        line += f" | val_ppl={float(self._last_val_ppl):.6g}" if self._last_val_ppl is not None else " | val_ppl=-"
+        line += f" | lr={float(lr):.6g}" if isinstance(lr, (int, float)) else " | lr=-"
+        self._append_line(line)
+        if self._print_to_stdout:
+            try:
+                trainer.print(line)
             except Exception:
                 pass
-        epoch = trainer.current_epoch
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        line = (
-            f"{ts} | epoch={epoch}"
-            f" | train_loss={float(train_loss):.4f}" if train_loss is not None else f"{ts} | epoch={epoch} | train_loss=-"
-        )
-        line += f" | val_loss={float(val_loss):.4f}" if val_loss is not None else " | val_loss=-"
-        line += f" | lr={lr:.6f}" if isinstance(lr, (int, float)) else " | lr=-"
-        self._append_line(line)
 
-    def _log_header(self):
-        header = "timestamp | epoch | train_loss | val_loss | lr"
-        self._append_line(header)
+        self._last_logged_step = step
+        self._last_log_time_s = now
+        self._last_logged_train_batches_seen = int(self._train_batches_seen)
+
+    def on_validation_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
+            return
+        metrics = trainer.callback_metrics
+        val_loss = metrics.get("val_loss")
+        val_ppl = metrics.get("val_ppl")
+        if val_loss is not None:
+            try:
+                self._last_val_loss = float(val_loss)
+            except Exception:
+                pass
+        if val_ppl is not None:
+            try:
+                self._last_val_ppl = float(val_ppl)
+            except Exception:
+                pass
+        lr = None
+        if trainer.optimizers:
+            try:
+                lr = trainer.optimizers[0].param_groups[0].get("lr", None)
+            except Exception:
+                lr = None
+        step = int(trainer.global_step)
+        epoch = int(trainer.current_epoch)
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        max_steps = int(getattr(trainer, "max_steps", 0) or 0)
+        if max_steps > 0:
+            pct = 100.0 * float(step) / float(max_steps)
+            progress = f"{pct:.2f}%"
+        else:
+            progress = "-"
+        line = f"{ts} | kind=val | step={step} | max_steps={max_steps} | progress={progress} | eta=- | epoch={epoch}"
+        line += f" | train_loss_step={float(self._last_train_loss_step):.6g}" if self._last_train_loss_step is not None else " | train_loss_step=-"
+        line += f" | val_loss={float(self._last_val_loss):.6g}" if self._last_val_loss is not None else " | val_loss=-"
+        line += f" | val_ppl={float(self._last_val_ppl):.6g}" if self._last_val_ppl is not None else " | val_ppl=-"
+        line += f" | lr={float(lr):.6g}" if isinstance(lr, (int, float)) else " | lr=-"
+        self._append_line(line)
+        if self._print_to_stdout:
+            try:
+                trainer.print(line)
+            except Exception:
+                pass
 
     def _append_line(self, text: str):
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -385,163 +684,261 @@ class MetricsLoggingCallback(pl.Callback):
             f.write(text + "\n")
 
 
+class RobustEarlyStopping(EarlyStopping):
+    """EarlyStopping that gracefully skips checks if the metric is missing."""
+ 
+    def on_train_epoch_end(self, trainer, pl_module):
+        # Skip if metric is not available yet (common at end of training epoch before validation)
+        if self.monitor not in trainer.callback_metrics:
+            return
+        super().on_train_epoch_end(trainer, pl_module)
+
+    def on_validation_end(self, trainer, pl_module):
+        # Skip if metric is not available
+        if self.monitor not in trainer.callback_metrics:
+            return
+        super().on_validation_end(trainer, pl_module)
+
+
+class EarlyStoppingRespectConfig(RobustEarlyStopping):
+    def __init__(self, *args, warmup_steps: int = 0, **kwargs):
+        self._configured_patience = int(kwargs.get("patience", 0) or 0)
+        self._configured_min_delta = float(kwargs.get("min_delta", 0.0) or 0.0)
+        super().__init__(*args, **kwargs)
+        self._warmup_steps = int(max(0, warmup_steps))
+
+    def load_state_dict(self, state_dict):
+        # When resuming, Lightning restores EarlyStopping internal counters such as
+        # wait_count. If you change patience between runs, the restored wait_count can
+        # cause an immediate stop (e.g. stop after only a few validations). We keep the
+        # restored best score, but reset the counter and re-apply configured thresholds.
+        super().load_state_dict(state_dict)
+        try:
+            if self._configured_patience > 0:
+                self.patience = int(self._configured_patience)
+        except Exception:
+            pass
+        try:
+            self.min_delta = float(self._configured_min_delta)
+        except Exception:
+            pass
+        try:
+            self.wait_count = 0
+        except Exception:
+            pass
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.global_step < self._warmup_steps:
+            return
+        super().on_train_epoch_end(trainer, pl_module)
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.global_step < self._warmup_steps:
+            return
+        super().on_validation_end(trainer, pl_module)
+
+
 def setup_logging() -> Path:
-    """Prepare logs directory and return a new log file path."""
     logs_dir = Path('logs')
     logs_dir.mkdir(exist_ok=True)
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_file = logs_dir / f"training_{stamp}.log"
-    # Optionally create/refresh a 'latest_training.log' symlink
-    latest = logs_dir / 'latest_training.log'
-    try:
-        if latest.exists() or latest.is_symlink():
-            latest.unlink()
-        latest.symlink_to(log_file.name)
-    except Exception:
-        pass
     return log_file
 
 
-def main(config_path='config.yaml'):
+def main(config_path: str = "config.yaml", no_resume: bool = False):
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
-    # env already set at import time
+
+    tcfg = cfg.get("training", {})
+    escfg = tcfg.get("early_stopping", {})
+    max_steps_print = tcfg.get("max_steps")
+    lr_schedule_max_steps_print = tcfg.get("lr_schedule_max_steps", max_steps_print)
+    print(
+        "[Config] "
+        f"lr_schedule={tcfg.get('lr_schedule')} "
+        f"lr={tcfg.get('lr')} "
+        f"warmup_ratio={tcfg.get('warmup_ratio')} "
+        f"min_lr_ratio={tcfg.get('min_lr_ratio', 0.0)} "
+        f"max_steps={max_steps_print} "
+        f"lr_schedule_max_steps={lr_schedule_max_steps_print} "
+        f"es_enabled={escfg.get('enabled', True)} "
+        f"es_patience={escfg.get('patience')} "
+        f"es_min_delta={escfg.get('min_delta')}"
+    )
 
     # Suppress specific PyTorch Lightning warnings
     warnings.filterwarnings("ignore", message="You're resuming from a checkpoint that ended before the epoch ended")
-
     pl.seed_everything(cfg['training']['seed'])
+
+    # ENFORCE OFFLINE MODE if configured, to prevent accidental network calls/bans
+    if cfg.get("data", {}).get("offline", False):
+        print("[Config] Offline mode enabled: enforcing HF_DATASETS_OFFLINE=1 and HF_HUB_OFFLINE=1")
+        os.environ["HF_DATASETS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+
+    os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    try:
+        from datasets.utils.logging import disable_progress_bar
+
+        disable_progress_bar()
+    except Exception:
+        pass
 
     tokenizer = get_tokenizer(cfg)
     train_loader, val_loader = make_dataloaders(cfg, tokenizer)
 
-    # Debug: Check if validation loader has data
-    print(f"Training dataset size: {len(train_loader.dataset)} sequences")
-    print(f"Validation dataset size: {len(val_loader.dataset)} sequences")
-
-    if len(val_loader.dataset) == 0:
-        print("!  Warning: Validation dataset is empty!")
-        print("? Consider reducing train_docs or increasing val_docs in config.yaml")
-
     lit = LitCausalLM(cfg, tokenizer)
-
+    
     # File logging
     log_file = setup_logging()
-    print(f"Training logs will be saved to: {log_file}")
-    metrics_logger_cb = MetricsLoggingCallback(log_file)
+    print(f"Training logs: {log_file}")
+    print_metrics_cfg = cfg.get('training', {}).get('print_metrics', None)
+    print_to_stdout = (not sys.stdout.isatty()) if print_metrics_cfg is None else bool(print_metrics_cfg)
+    metrics_logger_cb = MetricsLoggingCallback(log_file, print_to_stdout=print_to_stdout)
 
-    # Check for existing checkpoints and allow interactive selection if possible
-    resume_checkpoint = None
-    any_ckpt = discover_checkpoints()
-    if any_ckpt:
-        try:
-            if os.isatty(0):
-                resume_checkpoint = select_checkpoint_interactively()
-                if resume_checkpoint:
-                    print(f"Will resume from: {resume_checkpoint}")
-                else:
-                    print("Starting fresh training...")
-            else:
-                # Non-interactive: pick best available automatically
-                auto = find_latest_checkpoint()
-                if auto:
-                    resume_checkpoint = auto
-                    print(f"Non-interactive resume from: {auto}")
-                else:
-                    print("Starting fresh training...")
-        except Exception as e:
-            print(f"! Checkpoint selection failed ({e}). Falling back to fresh training.")
+    # Resume logic: auto-resume from latest if exists, but avoid incompatible strict-loads.
+    ckpt_dir = cfg['training'].get('checkpoint_dir', 'checkpoints')
+    auto_resume = bool(cfg['training'].get('auto_resume', True)) and (not bool(no_resume))
+    resume_checkpoint = find_latest_checkpoint(ckpt_dir) if auto_resume else None
+    if resume_checkpoint and not _is_resume_compatible(resume_checkpoint, cfg):
+        resume_checkpoint = None
+    if resume_checkpoint:
+        print(f"Resuming from latest checkpoint: {resume_checkpoint}")
     else:
-        print("No existing checkpoints found. Starting fresh training...")
+        print("Starting fresh training...")
 
     # Device selection
-    accelerator = cfg['hardware']['accelerator']
-    devices = cfg['hardware']['devices']
+    accelerator = cfg['hardware'].get('accelerator', 'auto')
+    devices = cfg['hardware'].get('devices', 1)
 
-    # Always write new checkpoints to a single, consistent directory
-    ckpt_dir = cfg['training'].get('checkpoint_dir', 'checkpoints')
-    checkpoint_cb = ModelCheckpoint(
+    # Validation/checkpoint cadence: treat `steps_per_epoch` / `save_every` as optimizer-step units.
+    steps_per_epoch = int(cfg["training"].get("steps_per_epoch", 0) or 0)
+    grad_accum = int(cfg["training"].get("grad_accum_steps", 1) or 1)
+    save_every = int(cfg["training"].get("save_every", 0) or 0)
+    val_check_interval = None
+    if steps_per_epoch > 0:
+        val_check_interval = max(1, steps_per_epoch * grad_accum)
+
+    # Callbacks
+    # NOTE: periodic checkpoints may be triggered on training-step boundaries
+    # (via every_n_train_steps). At that time validation metrics like `val_loss`
+    # may not exist yet, so avoid using `val_loss` in the filename template.
+    ckpt_every_opt_steps = save_every if save_every > 0 else steps_per_epoch
+    epoch_checkpoint_kwargs = dict(
         dirpath=ckpt_dir,
-        filename='epoch={epoch}-step={step}-val_loss={val_loss:.3f}',
-        save_top_k=1,
-        monitor='val_loss',
-        mode='min',
+        filename='epoch={epoch}-step={step}',
+        save_top_k=-1,
         save_last=True,
         save_on_train_epoch_end=False,
         auto_insert_metric_name=False,
     )
+    if ckpt_every_opt_steps and ckpt_every_opt_steps > 0:
+        epoch_checkpoint_kwargs["every_n_train_steps"] = max(1, int(ckpt_every_opt_steps) * grad_accum)
+    epoch_checkpoint_cb = ModelCheckpoint(**epoch_checkpoint_kwargs)
 
-    # Step-based checkpoints to allow resume even before first validation
-    step_save_every = cfg['training'].get('save_every', None)
-    step_checkpoint_cb = None
-    if step_save_every and isinstance(step_save_every, int) and step_save_every > 0:
-        step_checkpoint_cb = ModelCheckpoint(
-            dirpath=ckpt_dir,
-            filename='global_step={step}',
-            save_top_k=-1,
-            every_n_train_steps=step_save_every,
-            save_on_train_epoch_end=False,
-            auto_insert_metric_name=False,
-        )
-
-    # Early stopping on validation loss, evaluated after validation not train epoch end
-    es_cfg = cfg['training'].get('early_stopping', {})
-    early_stop_cb = EarlyStoppingRespectConfig(
+    best_checkpoint_cb = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename='best',
+        save_top_k=1,
         monitor='val_loss',
         mode='min',
-        patience=es_cfg.get('patience', cfg['training']['early_stopping']['patience']),
-        min_delta=es_cfg.get('min_delta', cfg['training']['early_stopping']['min_delta']),
-        check_on_train_epoch_end=False,
-        configured_patience=es_cfg.get('patience', cfg['training']['early_stopping']['patience']),
-        reset_wait_on_resume=True,
-        verbose=True,
+        save_last=False,
+        save_on_train_epoch_end=False,
+        auto_insert_metric_name=False,
     )
 
-    # Optionally cap steps per epoch to sync with validation cadence
-    steps_per_epoch = cfg['training'].get('steps_per_epoch', None)
+    es_cfg = cfg['training'].get('early_stopping', {})
+    if es_cfg.get('enabled', True):
+        max_steps = int(cfg['training']['max_steps'])
+        warmup_fraction = float(es_cfg.get('warmup_fraction', 0.0) or 0.0)
+        warmup_steps_es = int(max(0, warmup_fraction) * max_steps)
+        early_stop_cb = EarlyStoppingRespectConfig(
+            monitor='val_loss',
+            mode='min',
+            patience=es_cfg.get('patience', 5),
+            min_delta=es_cfg.get('min_delta', 0.001),
+            verbose=True,
+            warmup_steps=warmup_steps_es,
+        )
+    else:
+        early_stop_cb = None
 
-    trainer_kwargs = dict(
+    lr_schedule = str(cfg["training"].get("lr_schedule", "warmup_cosine")).lower()
+
+    # Callback ordering matters: on_validation_end hooks run in list order. For plateau
+    # training we want LR reductions to occur before early-stopping decisions.
+    callbacks: List[pl.Callback] = [
+        epoch_checkpoint_cb,
+        best_checkpoint_cb,
+        metrics_logger_cb,
+    ]
+
+    if bool(cfg.get("training", {}).get("reset_lr_on_resume", False)):
+        callbacks.insert(0, ResetLROnResumeCallback(cfg))
+
+    # Optional: plateau scheduler mode (mutates optimizer LR via callback).
+    if lr_schedule in {"plateau", "reduce_on_plateau"}:
+        rop_cfg = cfg['training'].get('reduce_on_plateau', {})
+        warmup_steps_cb = max(1, int(cfg['training'].get('warmup_ratio', 0.0) * cfg['training']['max_steps']))
+        rop_cb = ReduceLROnPlateauOnVal(
+            patience=rop_cfg.get('patience', 3),
+            factor=rop_cfg.get('factor', 0.5),
+            min_lr=rop_cfg.get('min_lr', 1e-6),
+            monitor='val_loss',
+            mode='min',
+            warmup_steps=warmup_steps_cb,
+        )
+        warmup_cb = WarmupLRCallback(warmup_steps_cb)
+        callbacks.extend([rop_cb, warmup_cb])
+
+    if early_stop_cb is not None:
+        callbacks.append(early_stop_cb)
+
+    trainer = pl.Trainer(
         accelerator=accelerator,
         devices=devices,
-        max_steps=cfg['training']['max_steps'],
-        precision=cfg['training']['precision'],
-        accumulate_grad_batches=cfg['training']['grad_accum_steps'],
+        max_steps=int(cfg['training']['max_steps']),
+        precision=int(cfg['training'].get('precision', 32)) if str(cfg['training'].get('precision', 32)).isdigit() else cfg['training'].get('precision', 32),
+        accumulate_grad_batches=cfg['training'].get('grad_accum_steps', 1),
+        fast_dev_run=bool(cfg['training'].get('fast_dev_run', False)),
+        overfit_batches=cfg['training'].get('overfit_batches', 0.0),
+        limit_train_batches=cfg['training'].get('limit_train_batches', 1.0),
         log_every_n_steps=cfg['training'].get('log_every_n_steps', 10),
-        logger=False,  # Disable logging to avoid TensorBoard warnings
+        logger=pl.loggers.CSVLogger("logs"),
+        enable_model_summary=bool(cfg['training'].get('enable_model_summary', False)),
+        enable_progress_bar=bool(cfg['training'].get('enable_progress_bar', sys.stdout.isatty())),
         enable_checkpointing=True,
-        callbacks=[c for c in [checkpoint_cb, step_checkpoint_cb, early_stop_cb, metrics_logger_cb] if c is not None],
+        callbacks=callbacks,
         gradient_clip_val=cfg['training'].get('gradient_clip_val', 1.0),
-        limit_val_batches=cfg['training'].get('limit_val_batches', 1.0),   # Use full validation set
+        limit_val_batches=cfg['training'].get('limit_val_batches', 1.0),
+        val_check_interval=val_check_interval if val_check_interval is not None else 1.0,
     )
 
-    if steps_per_epoch is not None:
-        trainer_kwargs['limit_train_batches'] = steps_per_epoch
-
-    trainer = pl.Trainer(**trainer_kwargs)
-
+    print("Starting training loop...")
     trainer.fit(
         lit,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
-        ckpt_path=resume_checkpoint  # This will resume from checkpoint if provided
+        ckpt_path=resume_checkpoint
     )
+    print("Training completed.")
 
-    # Save final checkpoint
+    # Save final
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(ckpt_dir, 'final.ckpt')
     trainer.save_checkpoint(ckpt_path)
     print(f"Saved final checkpoint to {ckpt_path}")
 
-    # Also copy best model to a stable name for easy discovery
-    best_path = checkpoint_cb.best_model_path
-    if best_path and os.path.exists(best_path):
-        best_copy = os.path.join(ckpt_dir, 'best.ckpt')
-        try:
-            shutil.copy2(best_path, best_copy)
-            print(f"Best checkpoint copied to {best_copy}")
-        except Exception as e:
-            print(f"Warning: could not copy best checkpoint: {e}")
-
 
 if __name__ == '__main__':
-    main()
+    ap = argparse.ArgumentParser(description="Train the tiny educational Transformer.")
+    ap.add_argument("--config", type=str, default="config.yaml", help="Path to YAML config.")
+    ap.add_argument(
+        "--no_resume",
+        action="store_true",
+        help="Disable auto-resume even if checkpoints exist.",
+    )
+    args = ap.parse_args()
+    main(config_path=args.config, no_resume=bool(args.no_resume))

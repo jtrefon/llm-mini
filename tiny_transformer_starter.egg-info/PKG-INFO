@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: tiny-transformer-starter
+Version: 0.1.0
+Summary: Educational, from-scratch decoder-only Transformer (training + inference + SFT).
+Requires-Python: >=3.11
+License-File: LICENSE
+Dynamic: license-file
+Dynamic: requires-python
+Dynamic: summary

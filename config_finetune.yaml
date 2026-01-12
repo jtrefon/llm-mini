@@ -1,0 +1,58 @@
+model:
+  n_layers: 16
+  d_model: 768
+  n_heads: 12
+  n_kv_heads: 2
+  d_ff: 3072
+  dropout: 0.1
+  vocab_size: null
+  rope_theta: 1000000
+  tie_embeddings: true
+  swa_window: 0
+  gradient_checkpointing: false
+
+training:
+  seed: 42
+  seq_len: 1024
+  micro_batch_size: 7
+  grad_accum_steps: 8
+  max_epochs: 100
+  max_steps: 0
+  lr: 1.0e-5
+  lr_schedule: "warmup_cosine"
+  min_lr_ratio: 0.1
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  warmup_ratio: 0.05
+  precision: "bf16-mixed"
+  steps_per_epoch: 0
+  ckpt_dir: "checkpoints"
+  base_ckpt_path: "checkpoints/final.ckpt"
+
+  reduce_on_plateau:
+    enabled: true
+    factor: 0.5
+    patience: 2
+    threshold: 0.0005
+    cooldown: 0
+    min_lr: 1.0e-6
+
+  early_stopping:
+    enabled: true
+    patience: 6
+    min_delta: 0.0005
+    warmup_fraction: 0.1
+
+hardware:
+  accelerator: "auto"
+  devices: 1
+  num_workers: 4
+
+data:
+  offline: false
+  dataset: "tatsu-lab/alpaca"
+  split: "train"
+  tokenizer_name: "gpt2"
+  train_docs: 0
+  val_docs: 2000
