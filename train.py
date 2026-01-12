@@ -2,6 +2,7 @@ import os
 import yaml
 import math
 import logging
+import argparse
 from datetime import datetime
 from pathlib import Path
 import re
@@ -474,6 +475,48 @@ def find_latest_checkpoint(config_ckpt_dir: str = 'checkpoints') -> Optional[str
     return scored[0][2]
 
 
+def _checkpoint_hparams(path: str) -> Dict[str, Any]:
+    try:
+        try:
+            ckpt = torch.load(path, map_location="cpu", weights_only=True)  # PyTorch 2.2+
+        except TypeError:
+            ckpt = torch.load(path, map_location="cpu")
+    except Exception:
+        return {}
+    hp = ckpt.get("hyper_parameters", {})
+    return hp if isinstance(hp, dict) else {}
+
+
+def _is_resume_compatible(ckpt_path: str, cfg: Dict[str, Any]) -> bool:
+    """Best-effort compatibility check to avoid strict-load crashes on auto-resume."""
+    hp = _checkpoint_hparams(ckpt_path)
+    if not hp:
+        return True
+    saved_model = hp.get("model", {}) if isinstance(hp.get("model", {}), dict) else {}
+    cur_model = cfg.get("model", {}) if isinstance(cfg.get("model", {}), dict) else {}
+
+    keys = (
+        "n_layers",
+        "d_model",
+        "n_heads",
+        "n_kv_heads",
+        "d_ff",
+        "rope_theta",
+        "tie_embeddings",
+        "swa_window",
+    )
+    for k in keys:
+        if k in saved_model and k in cur_model:
+            if str(saved_model.get(k)) != str(cur_model.get(k)):
+                print(
+                    f"[Train] Auto-resume skipped: checkpoint model.{k}={saved_model.get(k)!r} "
+                    f"!= config model.{k}={cur_model.get(k)!r}"
+                )
+                return False
+
+    return True
+
+
 class MetricsLoggingCallback(pl.Callback):
     """Logs key metrics to a rotating timestamped file in logs/ directory."""
     def __init__(self, log_file: Path, print_to_stdout: bool = False):
@@ -703,7 +746,7 @@ def setup_logging() -> Path:
     return log_file
 
 
-def main(config_path='config.yaml'):
+def main(config_path: str = "config.yaml", no_resume: bool = False):
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
 
@@ -755,10 +798,12 @@ def main(config_path='config.yaml'):
     print_to_stdout = (not sys.stdout.isatty()) if print_metrics_cfg is None else bool(print_metrics_cfg)
     metrics_logger_cb = MetricsLoggingCallback(log_file, print_to_stdout=print_to_stdout)
 
-    # Resume logic: auto-resume from latest if exists
+    # Resume logic: auto-resume from latest if exists, but avoid incompatible strict-loads.
     ckpt_dir = cfg['training'].get('checkpoint_dir', 'checkpoints')
-    auto_resume = bool(cfg['training'].get('auto_resume', True))
+    auto_resume = bool(cfg['training'].get('auto_resume', True)) and (not bool(no_resume))
     resume_checkpoint = find_latest_checkpoint(ckpt_dir) if auto_resume else None
+    if resume_checkpoint and not _is_resume_compatible(resume_checkpoint, cfg):
+        resume_checkpoint = None
     if resume_checkpoint:
         print(f"Resuming from latest checkpoint: {resume_checkpoint}")
     else:
@@ -888,4 +933,12 @@ def main(config_path='config.yaml'):
 
 
 if __name__ == '__main__':
-    main()
+    ap = argparse.ArgumentParser(description="Train the tiny educational Transformer.")
+    ap.add_argument("--config", type=str, default="config.yaml", help="Path to YAML config.")
+    ap.add_argument(
+        "--no_resume",
+        action="store_true",
+        help="Disable auto-resume even if checkpoints exist.",
+    )
+    args = ap.parse_args()
+    main(config_path=args.config, no_resume=bool(args.no_resume))

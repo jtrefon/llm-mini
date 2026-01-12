@@ -1,90 +1,108 @@
-# Tiny Transformer Starter (MBP‑friendly)
+# Tiny Transformer (Educational LLM From Scratch)
 
-A clean, from‑scratch, decoder‑only Transformer with **RMSNorm + RoPE + GQA + SwiGLU**, built for a **MacBook M‑series (MPS)** first run. Uses **PyTorch Lightning** for painless training. Easy, hackable, and ready to scale.
+An educational, decoder-only Transformer you can read end-to-end: **model**, **data packing**, **training**, **inference**, **checkpoint eval**, and **SFT fine-tuning**.
 
-## Features
+This is not the Hugging Face `transformers` library (it only uses HF for tokenizers/datasets).
 
-- **Architecture**: Modern Llama-style components.
-    - **RMSNorm**: Pre-normalization for better stability.
-    - **RoPE**: Rotary Positional Embeddings for better long-context performance.
-    - **SwiGLU**: Gated linear unit activation in the MLP.
-    - **GQA**: Grouped-Query Attention for faster inference and lower memory usage.
-- **Optimized for MPS**: Defaults configured for Apple Silicon Metal (MPS) acceleration.
-- **PyTorch Lightning**: Organized training loop with checkpointing, logging, and callbacks.
-- **Zero Dependencies**: Uses standard Hugging Face `transformers` and `datasets` just for tokenization and data loading.
+## Why this exists
+
+Most “train an LLM” repos are either too big to understand, or too abstract to teach. This project aims to be:
+
+- **Readable**: small, explicit code (no hidden magic).
+- **Hackable**: change one thing and see what breaks/helps.
+- **Educational**: enough modern features to be realistic (RoPE, RMSNorm, SwiGLU, GQA, KV cache).
+
+Start here: `docs/LEARNING_PATH.md`.
+
+## What you’ll learn (practical)
+
+- How a decoder-only Transformer produces logits and trains with next-token cross-entropy (`model.py`, `train.py`)
+- How tokenization + document boundaries + packing affect training (`data.py`)
+- Why RoPE/RMSNorm/SwiGLU/GQA exist and where they sit in code (`model.py`)
+- How sampling works (temperature, top-p, top-k, repetition penalty) (`infer.py`)
+- How to compare checkpoints quickly before fine-tuning (`evaluate_checkpoints.py`, `eval_val.py`)
+- How simple instruction fine-tuning works (mask prompt tokens, train on responses) (`finetune.py`)
 
 ## Quickstart
 
-### 1. Installation
+### 0) Requirements
+
+- Python `3.11+`
+- PyTorch `2.3+`
+- One of: Apple Silicon (MPS), NVIDIA (CUDA), or CPU
+
+### 1) Install
 
 ```bash
-# Create venv and install
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Training
+### 2) Smoke test (fast, local text)
 
-Train on your laptop with the default tiny config:
-
-```bash
-# Optional: Login to HF if you use private tokenizers/datasets
-# huggingface-cli login
-
-# Train (MBP M‑series friendly defaults)
-python train.py --config config.yaml
-```
-
-### 3. Inference
-
-Generate text from a trained checkpoint:
+Runs ~50 steps on `data/tiny_corpus.txt` to prove the pipeline works.
 
 ```bash
-python infer.py --ckpt checkpoints/final.ckpt --tokenizer gpt2 --prompt "The history of Dubai is"
+python3 train.py --config config_smoke.yaml
+python3 infer.py --ckpt checkpoints/final.ckpt --tokenizer gpt2 --prompt "Attention is"
 ```
 
-### 4. Evaluation
+### 3) Train (bigger, HF dataset)
 
-Score checkpoints on simple probes:
+`config.yaml` defaults to streaming Wikipedia.
 
 ```bash
-python evaluate_checkpoints.py \
-  --checkpoints 'checkpoints/*.ckpt' \
-  --tokenizer gpt2 \
-  --top-k 5 \
-  --cases cases/wiki_basics.yaml
+python3 train.py --config config.yaml
 ```
 
-## Architecture Details
+### 4) Inference
 
-This codebase implements a "mini" version of modern LLM architectures (like Llama 2/3, Mistral).
-
--   **Rotary Positional Embeddings (RoPE)**: Applied to Queries and Keys to encode position without absolute positional embeddings.
--   **Grouped Query Attention (GQA)**: Keys and Values are shared across groups of Query heads. controlled by `n_heads` and `n_kv_heads` in `config.yaml`.
--   **SwiGLU MLP**: The feed-forward network uses the Swish-Gated Linear Unit formulation. `d_ff` is typically 4 * `d_model` * (2/3).
--   **RMSNorm**: Used instead of LayerNorm for normalization.
-
-## Project Structure
-
-```
-├── model.py              # The Transformer architecture (PyTorch nn.Module)
-├── data.py               # Dataset processing (PackedLMDataset, streams)
-├── train.py              # Training script & PyTorch Lightning Module
-├── infer.py              # Simple inference script
-├── config.yaml           # Configuration file
-├── checkpoints/          # Saved model checkpoints
-└── logs/                 # Training logs
+```bash
+python3 infer.py --ckpt checkpoints/final.ckpt --tokenizer gpt2 --prompt "The history of Dubai is"
 ```
 
-## Scaling Up (GPU / 4090)
+### 5) Evaluate checkpoints
 
-To move to a dedicated GPU environment:
+```bash
+python3 evaluate_checkpoints.py --checkpoints 'checkpoints/*.ckpt' --tokenizer gpt2 --cases cases/wiki_basics.yaml
+python3 eval_val.py --ckpt checkpoints/best.ckpt --config config.yaml --tokenizer auto
+python3 list.py
+```
 
-1.  Update `config.yaml`:
-    -   `hardware.accelerator: gpu`
-    -   Increase `model.n_layers`, `model.d_model`, `training.seq_len`.
-2.  (Optional) Install `flash-attn` for faster attention kernels (MPS does not support FlashAttention yet).
+### 6) Fine-tune (SFT)
+
+```bash
+python3 finetune.py --config config_finetune.yaml
+```
+
+## Project structure
+
+```
+.
+├── model.py                 # Decoder-only Transformer (RoPE, RMSNorm, SwiGLU, GQA, KV cache)
+├── data.py                  # HF + local text loaders, packing into fixed-length sequences
+├── train.py                 # Pretraining loop (PyTorch Lightning), checkpointing, logging
+├── finetune.py              # Instruction SFT on Alpaca-style data (masked prompt loss)
+├── infer.py                 # Load checkpoint + sample text (temperature/top-p/top-k/etc.)
+├── evaluate_checkpoints.py  # Quick ranking on small prompt/target case files
+├── eval_val.py              # True val_loss / val_ppl for a checkpoint + config dataloader
+├── list.py                  # Inspect checkpoints (epoch/step/loss metadata)
+├── config_smoke.yaml        # Fast local smoke test config
+├── config.yaml              # Default training config (HF dataset)
+├── config_finetune.yaml     # Default SFT config (HF dataset)
+└── docs/                    # Educational walkthroughs
+```
+
+## Docs
+
+- `docs/LEARNING_PATH.md` — suggested order + “what to read first”
+- `docs/CONFIG_REFERENCE.md` — config knobs and what they do
+- `docs/TROUBLESHOOTING.md` — common issues (MPS/CUDA/CPU, OOM, offline mode)
+
+## Contributing
+
+See `CONTRIBUTING.md`.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) file.
+Apache 2.0. See `LICENSE`.

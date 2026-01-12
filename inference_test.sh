@@ -1,7 +1,26 @@
-# Set up variables
-PY=".venv/bin/python"
-CKPT="sft-best.ckpt"
-DEVICE="mps"  # Using MPS as requested
+#!/usr/bin/env bash
+set -euo pipefail
+
+PY="${PY:-.venv/bin/python}"
+DEVICE="${DEVICE:-mps}"
+
+# Usage:
+#   bash inference_test.sh [ckpt_path]
+# Example:
+#   bash inference_test.sh checkpoints/final.ckpt
+CKPT="${1:-checkpoints/final.ckpt}"
+
+if [[ ! -x "$PY" ]]; then
+  echo "Expected Python at: $PY"
+  echo "Create the venv: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
+  exit 1
+fi
+
+if [[ ! -f "$CKPT" ]]; then
+  echo "Checkpoint not found: $CKPT"
+  echo "Train first: $PY train.py --config config.yaml"
+  exit 1
+fi
 
 # Helper function to run tests
 run_test() {
@@ -10,7 +29,7 @@ run_test() {
   echo "PROMPT: $2"
   echo "------------------------------"
   $PY infer.py --ckpt "$CKPT" --device "$DEVICE" --tokenizer "gpt2" \
-    --prompt "$2" --max_new_tokens 256 --temperature 0.4 --top_p 0.95 \
+    --prompt "$2" --max_new_tokens 256 --temperature 0 --top_p 1.0 --top_k 0 \
     --repetition_penalty 1.05 --no_repeat_ngram_size 3 --compute_ppl
 }
 

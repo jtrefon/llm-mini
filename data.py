@@ -1,5 +1,6 @@
 from typing import Iterator, List, Dict, Optional, Iterable, Callable, Union, Any, Tuple
 import itertools
+from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 from typing import TYPE_CHECKING
@@ -26,6 +27,37 @@ def _get_optional_positive_int(
     if key not in cfg:
         return default
     return _coerce_optional_positive_int(cfg.get(key))
+
+
+def _resolve_local_dataset_path(dataset_spec: str) -> Optional[Path]:
+    """Resolve a dataset spec to a local text file path if applicable.
+
+    Supported forms:
+    - "file:relative/or/absolute/path.txt"
+    - "local:relative/or/absolute/path.txt"
+    - plain path string that exists on disk
+    """
+    if not isinstance(dataset_spec, str) or not dataset_spec:
+        return None
+    spec = dataset_spec.strip()
+    for prefix in ("file:", "local:"):
+        if spec.startswith(prefix):
+            candidate = spec[len(prefix) :].strip()
+            if not candidate:
+                return None
+            p = Path(candidate)
+            return p if p.exists() and p.is_file() else None
+    p = Path(spec)
+    return p if p.exists() and p.is_file() else None
+
+
+def _iter_text_file(path: Path) -> Iterator[str]:
+    """Yield non-empty lines as documents."""
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            text = line.strip()
+            if text:
+                yield text
 
 
 class PackedLMDataset(Dataset):
@@ -198,7 +230,15 @@ def load_text_dataset(
     verbose: bool = True,
     offline_mode: bool = False,
 ) -> Iterator[str]:
-    """Load a HF dataset and yield raw text strings."""
+    """Load a dataset and yield raw text strings.
+
+    Supports Hugging Face datasets and a local text file dataset (one doc per line).
+    """
+    local_path = _resolve_local_dataset_path(name)
+    if local_path is not None:
+        yield from _iter_text_file(local_path)
+        return
+
     from datasets import load_dataset
     from datasets import DownloadConfig
     import os
@@ -304,6 +344,7 @@ def make_dataloaders(
     max_doc_len = _get_optional_positive_int(
         data_cfg, "max_doc_len", None
     )
+    local_dataset_path = _resolve_local_dataset_path(str(data_cfg.get("dataset", "")))
 
     streaming = bool(data_cfg["streaming"])
     accelerator = cfg["hardware"].get("accelerator", "auto")
@@ -354,6 +395,57 @@ def make_dataloaders(
             pin_memory = False
             persistent = False
             prefetch = None
+
+    # Local text file dataset (one document per line).
+    # This is useful for fully-contained smoke tests and educational experiments.
+    if local_dataset_path is not None:
+        print(f"Using local text dataset: {local_dataset_path}")
+        train_docs = _get_optional_positive_int(data_cfg, "train_docs", None)
+        val_docs = _get_optional_positive_int(data_cfg, "val_docs", 1000)
+        val_skip_docs = _get_optional_positive_int(data_cfg, "val_skip_docs", None)
+        if val_skip_docs is not None:
+            skip_for_val = val_skip_docs
+        else:
+            skip_for_val = train_docs if train_docs is not None else 0
+
+        def _texts_from_file(skip_docs: int = 0) -> Iterator[str]:
+            it: Iterable[str] = _iter_text_file(local_dataset_path)
+            if skip_docs > 0:
+                it = itertools.islice(it, skip_docs, None)
+            for i, text in enumerate(it):
+                if train_docs is not None and skip_docs == 0 and i >= train_docs:
+                    break
+                if val_docs is not None and skip_docs > 0 and i >= val_docs:
+                    break
+                yield text
+
+        train_ds = StreamingPackedLMDataset(
+            texts_factory=lambda: _texts_from_file(skip_docs=0),
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            max_doc_len=max_doc_len,
+            max_docs=train_docs,
+        )
+        val_ds = StreamingPackedLMDataset(
+            texts_factory=lambda: _texts_from_file(skip_docs=skip_for_val),
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            max_doc_len=max_doc_len,
+            max_docs=val_docs,
+        )
+
+        dl_kwargs = dict(
+            batch_size=cfg["training"]["micro_batch_size"],
+            shuffle=False,  # IterableDataset cannot be shuffled by DataLoader
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=collate,
+        )
+        if persistent:
+            dl_kwargs["persistent_workers"] = True
+        if prefetch is not None:
+            dl_kwargs["prefetch_factor"] = prefetch
+        return DataLoader(train_ds, **dl_kwargs), DataLoader(val_ds, **dl_kwargs)
 
     if streaming:
         print("Using streaming IterableDataset to avoid loading full corpus into memory")

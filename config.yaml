@@ -52,13 +52,13 @@ training:
     warmup_fraction: 0.3  # Ignore early-stopping decisions in initial 30% of steps
 
 hardware:
-  accelerator: "cuda"      # "mps" on Apple Silicon; use "cuda" on 4090; "auto" also works
+  accelerator: "auto"      # "mps" on Apple Silicon; use "cuda" on NVIDIA; "auto" picks the best available
   devices: 1
   num_workers: 8         # Increased for RTX 4090; will be auto-limited to max_shards
 
 # Dataset options. Start with a preprocessed, manageable corpus.
 data:
-  offline: true           # Enforce offline mode to prevent network requests (timeout/ban safety)
+  offline: false          # If true, requires dataset/tokenizer already cached (no network calls)
   dataset: "wikimedia/wikipedia"
   split: "train"
   val_split: "train"      # set to a separate split (e.g. "validation") when available

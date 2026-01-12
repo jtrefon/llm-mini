@@ -45,12 +45,12 @@ training:
     warmup_fraction: 0.1
 
 hardware:
-  accelerator: "cuda"
+  accelerator: "auto"
   devices: 1
   num_workers: 4
 
 data:
-  offline: true
+  offline: false
   dataset: "tatsu-lab/alpaca"
   split: "train"
   tokenizer_name: "gpt2"

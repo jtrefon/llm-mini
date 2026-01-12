@@ -1,0 +1,54 @@
+model:
+  n_layers: 2
+  d_model: 128
+  n_heads: 4
+  n_kv_heads: 2
+  d_ff: 256
+  dropout: 0.0
+  vocab_size: null
+  rope_theta: 10000
+  tie_embeddings: true
+  swa_window: 0
+  gradient_checkpointing: false
+
+training:
+  seq_len: 64
+  micro_batch_size: 8
+  grad_accum_steps: 1
+  max_steps: 50
+  save_every: 0
+  lr_schedule: "warmup_cosine"
+  lr: 3.0e-4
+  min_lr_ratio: 0.1
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  warmup_ratio: 0.1
+  precision: 32
+  seed: 42
+  steps_per_epoch: 0
+  auto_resume: false
+  reset_lr_on_resume: false
+  enable_progress_bar: true
+  early_stopping:
+    enabled: false
+
+hardware:
+  accelerator: "auto"
+  devices: 1
+  num_workers: 0
+
+data:
+  offline: false
+  dataset: "data/tiny_corpus.txt"
+  split: "train"
+  val_split: "train"
+  text_field: "text"
+  streaming: true
+  tokenizer_name: "gpt2"
+  max_shards: 0
+  pack_sequences: true
+  max_doc_len: 0
+  shuffle_buffer: 0
+  train_docs: 0
+  val_docs: 10

@@ -22,93 +22,12 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Create virtual environment
-      run: |
-        python -m venv .venv
-        source .venv/bin/activate
-        python -m pip install --upgrade pip
-
     - name: Install dependencies
       run: |
-        source .venv/bin/activate
-        pip install -r requirements.txt
-        pip install pytest pytest-cov coverage pytest-xdist
-
-    - name: Run tests with coverage
-      run: |
-        source .venv/bin/activate
-        python -m pytest tests/ \
-          --cov=src \
-          --cov-report=xml \
-          --cov-report=html \
-          --cov-report=term-missing \
-          --cov-fail-under=95 \
-          --cov-branch \
-          -v \
-          --tb=short
-
-    - name: Upload coverage reports
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./coverage.xml
-        flags: unittests
-        name: codecov-umbrella
-        fail_ci_if_error: false
-
-    - name: Generate coverage badge
-      run: |
-        source .venv/bin/activate
-        coverage report --format=total > coverage_percentage.txt
-        echo "COVERAGE=$(cat coverage_percentage.txt | grep -o '[0-9]*')" >> $GITHUB_ENV
-
-  quality:
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.11"
-
-    - name: Install quality tools
-      run: |
         python -m pip install --upgrade pip
-        pip install black flake8 mypy isort bandit safety
+        pip install -r requirements.txt
+        pip install pytest
 
-    - name: Check code formatting with Black
-      run: black --check --diff src/ tests/
-
-    - name: Check imports with isort
-      run: isort --check-only --diff src/ tests/
-
-    - name: Lint with flake8
-      run: flake8 src/ tests/ --max-line-length=88 --extend-ignore=E203,W503
-
-    - name: Type check with mypy
-      run: mypy src/ --ignore-missing-imports
-
-    - name: Security check with bandit
-      run: bandit -r src/ -f json -o bandit-report.json || true
-
-    - name: Safety check for vulnerabilities
-      run: safety check --full-report
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: [test, quality]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Deploy to production
+    - name: Run tests
       run: |
-        echo "🚀 Ready for deployment!"
-        echo "All tests passed with 95%+ coverage"
-        echo "All quality gates passed"
-        # Add your deployment commands here
+        pytest

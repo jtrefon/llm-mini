@@ -1,30 +1,26 @@
-"""Setup script for transformers package."""
-from setuptools import setup, find_packages
+"""Minimal setup for the educational, script-first repo.
+
+This project is intentionally small and keeps most code at the repository root
+(e.g. model.py, train.py). We expose those as `py_modules` so `pip install .`
+works for users who prefer it, without pretending we have a full `src/` package.
+"""
+
+from setuptools import setup
+
 
 setup(
-    name="transformers-clean-arch",
-    version="1.0.0",
-    description="Transformer training with Clean Architecture",
-    author="Craftsman Developer",
-    packages=find_packages(where="src"),
-    package_dir={"": "src"},
+    name="tiny-transformer-starter",
+    version="0.1.0",
+    description="Educational, from-scratch decoder-only Transformer (training + inference + SFT).",
     python_requires=">=3.11",
-    install_requires=[
-        "torch>=2.0.0",
-        "pytorch-lightning>=2.0.0",
-        "transformers>=4.0.0",
-        "datasets>=2.0.0",
-        "pydantic>=2.0.0",
-        "pyyaml>=6.0",
+    py_modules=[
+        "data",
+        "eval_val",
+        "evaluate_checkpoints",
+        "finetune",
+        "infer",
+        "list",
+        "model",
+        "train",
     ],
-    extras_require={
-        "dev": [
-            "pytest>=8.0.0",
-            "pytest-cov>=6.0.0",
-            "black>=23.0.0",
-            "flake8>=6.0.0",
-            "mypy>=1.0.0",
-            "isort>=5.12.0",
-        ],
-    },
 )

@@ -1,0 +1,17 @@
+LICENSE
+README.md
+data.py
+eval_val.py
+evaluate_checkpoints.py
+finetune.py
+infer.py
+list.py
+model.py
+setup.py
+train.py
+tests/test_data.py
+tests/test_model.py
+tiny_transformer_starter.egg-info/PKG-INFO
+tiny_transformer_starter.egg-info/SOURCES.txt
+tiny_transformer_starter.egg-info/dependency_links.txt
+tiny_transformer_starter.egg-info/top_level.txt
